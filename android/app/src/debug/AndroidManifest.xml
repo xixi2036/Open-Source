@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!--
+            仅 debug：adb 广播 base64 文本到输入框，见 DebugTextReceiver。
+            要求 DUMP 权限（adb shell 持有，普通 App 无法获得），避免设备上其他 App 向输入框注入文字。
+        -->
+        <receiver
+            android:name=".debug.DebugTextReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+    </application>
+</manifest>

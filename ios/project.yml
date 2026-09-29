@@ -1,0 +1,89 @@
+name: Hush
+options:
+  bundleIdPrefix: com.hush
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # IOS-24：项目代码按 targeted 级别检查并发安全（SDK 自身的警告不阻塞）
+    SWIFT_STRICT_CONCURRENCY: targeted
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    from: 153.0.0
+targets:
+  Hush:
+    type: application
+    platform: iOS
+    sources:
+      - path: Hush
+    dependencies:
+      - framework: Frameworks/HushCore.xcframework
+        embed: false
+      - package: WebRTC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hush.app
+        INFOPLIST_FILE: Hush/Resources/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        OTHER_LDFLAGS: ["-lc++"]
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    postBuildScripts:
+      # 仅 Debug：打开「文件」App 共享，供 UI 测试把示例文件放进 Documents；Release 不暴露
+      - name: Debug-only file sharing
+        script: |
+          if [ "$CONFIGURATION" = "Debug" ]; then
+            PLIST="$TARGET_BUILD_DIR/$INFOPLIST_PATH"
+            for KEY in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+              /usr/libexec/PlistBuddy -c "Set :$KEY true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$KEY bool true" "$PLIST"
+            done
+          fi
+          touch "$DERIVED_FILE_DIR/debug-file-sharing.stamp"
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+        outputFiles:
+          - $(DERIVED_FILE_DIR)/debug-file-sharing.stamp
+        basedOnDependencyAnalysis: false
+        showEnvVars: false
+  HushTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: HushTests
+    dependencies:
+      - target: Hush
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.hush.app.tests
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+  HushUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: HushUITests
+    dependencies:
+      - target: Hush
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Hush
+        PRODUCT_BUNDLE_IDENTIFIER: com.hush.app.uitests
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+schemes:
+  Hush:
+    build:
+      targets:
+        Hush: all
+        HushTests: [test]
+        HushUITests: [test]
+    test:
+      targets:
+        - HushTests
+        - HushUITests

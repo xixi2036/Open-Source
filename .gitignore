@@ -1,0 +1,19 @@
+# 构建产物
+/server/data/
+/server/bin/
+/core/target/
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/jniLibs/
+/ios/build/
+/ios/*.xcodeproj/xcuserdata/
+/ios/Frameworks/
+*.xcuserstate
+DerivedData/
+.DS_Store
+.idea/
+/android/app/src/main/java/uniffi/
+/ios/Hush/Core/Generated/
+/ios/Hush.xcodeproj/

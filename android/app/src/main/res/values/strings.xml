@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hush</string>
+
+    <!-- 通知渠道 -->
+    <string name="ch_messages">消息</string>
+    <string name="ch_messages_desc">新消息提醒</string>
+    <string name="ch_calls">来电</string>
+    <string name="ch_calls_desc">语音/视频来电</string>
+    <string name="ch_ongoing_call">通话中</string>
+    <string name="ch_ongoing_call_desc">通话进行中的常驻通知</string>
+    <string name="ch_connection">后台连接</string>
+    <string name="ch_connection_desc">保持与服务器的连接</string>
+
+    <!-- 通知内容（为保护隐私不显示消息正文） -->
+    <string name="notif_new_message">来自 %1$s 的新消息</string>
+    <string name="notif_mentioned">%1$s 中有人@了你</string>
+    <string name="notif_incoming_voice">语音来电</string>
+    <string name="notif_incoming_video">视频来电</string>
+    <string name="notif_call_accept">接听</string>
+    <string name="notif_call_reject">拒绝</string>
+    <string name="notif_ongoing_voice">语音通话中</string>
+    <string name="notif_ongoing_video">视频通话中</string>
+    <string name="notif_ongoing_desc">点按返回通话</string>
+    <string name="notif_connection_title">Hush 正在保持连接</string>
+    <string name="notif_connection_desc">以便及时接收消息与来电</string>
+
+    <!-- 权限提示 -->
+    <string name="perm_mic_voice_message">需要麦克风权限才能发送语音</string>
+    <string name="perm_call_mic">需要麦克风权限才能通话</string>
+    <string name="perm_call_answer_mic">需要麦克风权限才能接听</string>
+    <string name="perm_storage_save">需要存储权限才能保存到相册</string>
+    <string name="full_screen_intent_title">来电全屏提醒</string>
+    <string name="full_screen_intent_desc">未授权时，锁屏状态下来电不会弹出接听界面</string>
+</resources>

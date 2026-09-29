@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!--
+        UniFFI 生成的绑定（src/main/java/uniffi/hushcore/hushcore.kt）在 API 33+ 使用 java.lang.ref.Cleaner，
+        低版本走 Class.forName 探测后回退到 JNA 实现，运行时是安全的；生成物不能手改，这里只对该目录豁免 NewApi。
+    -->
+    <issue id="NewApi">
+        <ignore path="src/main/java/uniffi/**" />
+    </issue>
+</lint>
