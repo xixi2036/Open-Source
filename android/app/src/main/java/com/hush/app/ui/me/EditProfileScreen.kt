@@ -1,5 +1,6 @@
 package com.hush.app.ui.me
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.hush.app.util.net
 
 import android.widget.Toast
@@ -59,9 +60,9 @@ import java.io.File
 fun EditProfileScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val acct by HushCore.account.collectAsState()
-    var name by remember { mutableStateOf(acct?.profile?.name ?: "") }
-    var about by remember { mutableStateOf(acct?.profile?.about ?: "") }
-    var avatar by remember { mutableStateOf<String?>(null) }
+    var name by rememberSaveable { mutableStateOf(acct?.profile?.name ?: "") }
+    var about by rememberSaveable { mutableStateOf(acct?.profile?.about ?: "") }
+    var avatar by rememberSaveable { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->

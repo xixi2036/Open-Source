@@ -1,14 +1,25 @@
 import SwiftUI
 
-/// 聊天页的一行：系统消息 / 通话记录 / 普通气泡
-struct MessageRow: View {
+/// 聊天页的一行：系统消息 / 通话记录 / 普通气泡。
+/// C2：实现 Equatable（只比较消息内容与选择状态，回调不参与比较），配合 .equatable()，
+/// 列表里其他状态变化（新消息、高亮、正在输入）时没变的行不重新求值。
+struct MessageRow: View, Equatable {
     let message: MessageItem
     let isGroup: Bool
+    /// 多选模式
+    var selecting = false
+    var isSelected = false
     var onLongPress: () -> Void
     var onQuoteTap: (String) -> Void
     var onOpenImage: (String) -> Void
+    var onOpenVideo: (String) -> Void = { _ in }
     var onShare: (URL) -> Void
     var onResend: () -> Void
+    var onToggleSelect: () -> Void = {}
+
+    nonisolated static func == (a: MessageRow, b: MessageRow) -> Bool {
+        a.message == b.message && a.isGroup == b.isGroup && a.selecting == b.selecting && a.isSelected == b.isSelected
+    }
 
     var body: some View {
         switch message.body {
@@ -17,8 +28,22 @@ struct MessageRow: View {
         case let .callLog(video, secs, _, _, reason):
             CallLogRow(message: message, video: video, secs: secs, reason: reason)
         default:
-            BubbleRow(message: message, isGroup: isGroup, onLongPress: onLongPress, onQuoteTap: onQuoteTap,
-                      onOpenImage: onOpenImage, onShare: onShare, onResend: onResend)
+            HStack(spacing: 0) {
+                if selecting {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 22))
+                        .foregroundStyle(isSelected ? Theme.accent : Theme.textSecondary)
+                        .padding(.leading, 12)
+                        .accessibilityHidden(true)
+                }
+                BubbleRow(message: message, isGroup: isGroup, onLongPress: onLongPress, onQuoteTap: onQuoteTap,
+                          onOpenImage: onOpenImage, onOpenVideo: onOpenVideo, onShare: onShare, onResend: onResend)
+                    .allowsHitTesting(!selecting)
+            }
+            .contentShape(Rectangle())
+            // 多选模式下整行都是选择区域（气泡里的链接、图片、重发按钮不再响应）
+            .onTapGesture { if selecting { onToggleSelect() } }
+            .accessibilityAddTraits(selecting && isSelected ? .isSelected : [])
         }
     }
 }
@@ -67,13 +92,14 @@ struct BubbleRow: View {
     var onLongPress: () -> Void
     var onQuoteTap: (String) -> Void
     var onOpenImage: (String) -> Void
+    var onOpenVideo: (String) -> Void = { _ in }
     var onShare: (URL) -> Void
     var onResend: () -> Void
     var core = HushCore.shared
 
     private var out: Bool { message.isOutgoing }
     private var isMediaOnly: Bool {
-        if case let .attachments(items, caption) = message.body, let f = items.first, f.kind == .image,
+        if case let .attachments(items, caption) = message.body, let f = items.first, f.kind == .image || f.kind == .video,
            caption?.isEmpty ?? true, message.quote == nil { return true }
         return false
     }
@@ -88,7 +114,7 @@ struct BubbleRow: View {
             VStack(alignment: out ? .trailing : .leading, spacing: 2) {
                 if !out && isGroup {
                     Text(core.contacts.displayName(message.senderId))
-                        .font(.system(size: 12, weight: .medium))
+                        .font(Fonts.sized(12, weight: .medium))
                         .foregroundStyle(Theme.namePalette[Theme.paletteIndex(for: message.senderId)])
                         .padding(.leading, 12)
                 }
@@ -97,6 +123,7 @@ struct BubbleRow: View {
                         Button(action: onResend) {
                             Image(systemName: "exclamationmark.circle.fill").font(.system(size: 20)).foregroundStyle(Theme.danger)
                         }
+                        .accessibilityLabel("发送失败，重新发送")
                         .accessibilityIdentifier("resendButton")
                     }
                     bubble
@@ -119,7 +146,7 @@ struct BubbleRow: View {
         VStack(alignment: .leading, spacing: 6) {
             if message.forwarded {
                 Label("转发的消息", systemImage: "arrowshape.turn.up.right")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(Fonts.sized(11, weight: .medium))
                     .foregroundStyle(out ? Theme.onAccent.opacity(0.8) : Theme.textSecondary)
                     .padding(.horizontal, isMediaOnly ? 8 : 0).padding(.top, isMediaOnly ? 4 : 0)
                     .accessibilityIdentifier("forwardedLabel")
@@ -154,9 +181,11 @@ struct BubbleRow: View {
     @ViewBuilder private var content: some View {
         switch message.body {
         case let .text(text):
-            Text(MentionText.attributed(text, message.mentions, color: out ? Theme.onAccent : Theme.accent, underline: out))
+            // 链接可点击（https 直接打开，http 先确认，见 ChatView 的 openURL）；部分选择走长按菜单里的「选择文字」
+            Text(LinkText.attributed(text, message.mentions, outgoing: out))
                 .font(Fonts.body)
                 .foregroundStyle(out ? Theme.onAccent : Theme.textPrimary)
+                .tint(out ? Theme.onAccent : Theme.accent)
                 .textSelection(.disabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("messageText")
@@ -167,7 +196,9 @@ struct BubbleRow: View {
                     ImageAttachmentView(message: message, item: item, index: i, onOpen: onOpenImage)
                 case .voice:
                     VoiceAttachmentView(message: message, item: item, index: i, outgoing: out)
-                case .video, .file:
+                case .video:
+                    VideoAttachmentView(message: message, item: item, index: i, onOpen: onOpenVideo)
+                case .file:
                     FileAttachmentView(message: message, item: item, index: i, outgoing: out, onShare: onShare)
                 }
             }
@@ -240,8 +271,8 @@ struct QuoteBlock: View {
             Rectangle().fill(outgoing ? Color.white : Theme.accent).frame(width: 3)
             VStack(alignment: .leading, spacing: 2) {
                 Text(quote.author == core.myId ? "你" : core.contacts.displayName(quote.author))
-                    .font(.system(size: 12, weight: .semibold))
-                Text(quote.text).font(.system(size: 13)).lineLimit(2)
+                    .font(Fonts.sized(12, weight: .semibold))
+                Text(quote.text).font(Fonts.sized(13)).lineLimit(2)
             }
             .foregroundStyle(outgoing ? Theme.onAccent.opacity(0.9) : Theme.textPrimary.opacity(0.8))
             Spacer(minLength: 0)
@@ -260,7 +291,7 @@ struct ReactionChips: View {
         HStack(spacing: 4) {
             ForEach(reactions, id: \.emoji) { r in
                 Text(r.userIds.count > 1 ? "\(r.emoji) \(r.userIds.count)" : r.emoji)
-                    .font(.system(size: 13))
+                    .font(Fonts.sized(13))
                     .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(Capsule().fill(Theme.surface))
                     .overlay(Capsule().stroke(Theme.divider, lineWidth: 1))

@@ -1,5 +1,7 @@
 package com.hush.app.ui.chats
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.hush.app.util.Savers
 import com.hush.app.util.net
 
 import androidx.compose.foundation.background
@@ -50,8 +52,8 @@ fun NewChatScreen(onBack: () -> Unit, onOpen: (String) -> Unit) {
 @Composable
 fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
     val friends by ContactsStore.friends.collectAsState()
-    var selected by remember { mutableStateOf(setOf<String>()) }
-    var name by remember { mutableStateOf("") }
+    var selected by rememberSaveable(stateSaver = Savers.StringSet) { mutableStateOf(setOf<String>()) }
+    var name by rememberSaveable { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()

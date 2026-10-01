@@ -35,7 +35,7 @@ struct WelcomeView: View {
                 .resizable().scaledToFit()
                 .frame(width: 120, height: 120)
                 .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-            Text("Hush 密语").font(.system(size: 30, weight: .bold)).foregroundStyle(Theme.textPrimary)
+            Text("Hush 密语").font(Fonts.sized(30, weight: .bold)).foregroundStyle(Theme.textPrimary)
             Text("端到端加密的私密聊天与朋友圈").font(Fonts.body).foregroundStyle(Theme.textSecondary)
             if let r = core.loggedOutReason {
                 Text(r).font(Fonts.secondary).foregroundStyle(Theme.danger)
@@ -55,22 +55,44 @@ struct WelcomeView: View {
 struct ServerStepView: View {
     @Binding var server: String
     var onNext: (String) -> Void
+    @State private var insecureHost: String?
+
     var body: some View {
         AuthPage(title: "服务器地址", subtitle: "本地部署的 Hush 服务器地址") {
-            TextField("http://127.0.0.1:8080", text: $server)
+            TextField(ServerAddress.placeholder, text: $server)
                 .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
                 .authField()
                 .accessibilityIdentifier("serverField")
+            if case .insecure = ServerAddress.check(server) {
+                Label("该地址使用未加密的 http 连接", systemImage: "exclamationmark.triangle.fill")
+                    .font(Fonts.secondary).foregroundStyle(Theme.danger)
+                    .accessibilityIdentifier("insecureServerHint")
+            }
         } footer: {
-            Button("下一步") { onNext(server.trimmingCharacters(in: .whitespaces)) }
+            Button("下一步") { next() }
                 .buttonStyle(PrimaryButtonStyle(enabled: valid))
                 .disabled(!valid)
                 .accessibilityIdentifier("serverNext")
         }
+        // B11：公网主机 + 明文 http 必须明确警告并由用户确认；本机 / 私网地址（本地部署）不打扰
+        .alert("连接未加密", isPresented: Binding(get: { insecureHost != nil }, set: { if !$0 { insecureHost = nil } })) {
+            Button("取消", role: .cancel) {}
+            Button("仍然使用 http", role: .destructive) { onNext(trimmed) }
+                .accessibilityIdentifier("insecureServerConfirm")
+        } message: {
+            Text("\(insecureHost ?? "") 不是本机或局域网地址，却使用明文 http。验证码、登录令牌和通讯元数据会在网络上明文传输，可能被窃听或篡改（消息内容仍是端到端加密的）。建议改用 https。")
+        }
     }
-    private var valid: Bool {
-        let s = server.trimmingCharacters(in: .whitespaces)
-        return s.hasPrefix("http://") || s.hasPrefix("https://")
+
+    private var trimmed: String { server.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var valid: Bool { ServerAddress.check(server) != .invalid }
+
+    private func next() {
+        switch ServerAddress.check(server) {
+        case .invalid: return
+        case .ok: onNext(trimmed)
+        case let .insecure(host): insecureHost = host
+        }
     }
 }
 
@@ -113,7 +135,14 @@ struct EmailStepView: View {
                 let e = email.trimmingCharacters(in: .whitespaces).lowercased()
                 try await HushCore.shared.requestCode(server: server.trimmingCharacters(in: .whitespaces), email: e)
                 onNext(e)
-            } catch { self.error = describe(error) }
+            } catch {
+                // 核心拒绝公网主机上的明文 http（本机 / 私网 / .local 仍允许）：给出明确提示
+                if case HushError.InvalidInput = error, case .insecure = ServerAddress.check(server) {
+                    self.error = "公网服务器必须使用 https"
+                } else {
+                    self.error = describe(error)
+                }
+            }
             loading = false
         }
     }
@@ -205,7 +234,7 @@ struct AuthPage<Content: View, Footer: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(title).font(.system(size: 26, weight: .bold)).foregroundStyle(Theme.textPrimary)
+            Text(title).font(Fonts.sized(26, weight: .bold)).foregroundStyle(Theme.textPrimary)
             Text(subtitle).font(Fonts.body).foregroundStyle(Theme.textSecondary)
             content.padding(.top, 8)
             Spacer()
@@ -219,9 +248,9 @@ struct AuthPage<Content: View, Footer: View>: View {
 
 extension View {
     func authField() -> some View {
-        self.font(.system(size: 17))
+        self.font(Fonts.sized(17))
             .padding(.horizontal, 14)
-            .frame(height: 50)
+            .frame(minHeight: 50)
             .background(RoundedRectangle(cornerRadius: Theme.cardRadius).fill(Theme.surface))
     }
 }

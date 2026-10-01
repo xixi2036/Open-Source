@@ -9,8 +9,11 @@ settings:
     SWIFT_VERSION: "5.0"
     # IOS-24：项目代码按 targeted 级别检查并发安全（SDK 自身的警告不阻塞）
     SWIFT_STRICT_CONCURRENCY: targeted
-    DEVELOPMENT_TEAM: ""
-    CODE_SIGN_STYLE: Automatic
+# 签名：团队 ID 不写在工程里，由 Config/Signing.xcconfig 从 Config/Local.xcconfig（不入库）或
+# 环境变量 HUSH_DEVELOPMENT_TEAM 读取，见该文件的说明
+configFiles:
+  Debug: Config/Signing.xcconfig
+  Release: Config/Signing.xcconfig
 packages:
   WebRTC:
     url: https://github.com/stasel/WebRTC

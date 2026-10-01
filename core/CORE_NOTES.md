@@ -22,8 +22,8 @@
 - **身份记录（TOFU）**：第一次需要对端身份时（claim、收到 PreKey、查安全码）从服务端取回并保存。之后如果 claim 返回的 identity 与本地记录不同，或者 PreKey 携带的身份与本地不同而与服务端最新记录一致，就按「身份变更」处理：丢弃 Olm 会话，清除已核验标记，从所有 Megolm 出站会话的已分发名单中移除该用户（下次发送时重新发 room_key），在单聊中插入系统消息「与 X 的安全码已变更」，并发出 `KeyChanged` 事件。
 - 收到服务端事件 `key_changed{user_id}` 时处理方式相同。由于此时还不知道新身份，本地身份记录会被删除，下次 claim 时重新按首次信任处理。
 - **会话选择**：每个对端最多保留 5 个 Olm 会话，超出时按最近使用淘汰。加密时用最近使用的会话。解密 PreKey 时，先找 `session_keys` 相同的已有会话，找不到再 `create_inbound_session`。解密 Normal 时按最近使用顺序逐个尝试，vodozemac 解密失败不会改变会话状态。双方同时发起会话导致两条会话并存时，也能按这个规则收敛。
-- **解密失败**：该消息存为 `Undecryptable` 占位（消息 id = 信封 id），然后向对方发送 `session_reset`（同一用户 60 秒内最多发一次）。发送前会先删掉本地与该用户的全部 Olm 会话，再 claim 新密钥，所以 reset 本身以 PreKey 消息送达。
-- **收到 `session_reset`**：只保留承载该消息的那条会话（它是双方刚建立的新会话），丢弃其余会话。契约原文是「丢弃会话」，这样做既满足重建的目的，又不会反复消耗 OTK，也避免双方互发 reset 形成循环。
+- **解密失败**：该消息存为 `Undecryptable` 占位（消息 id = 信封 id），然后向对方发送 `session_reset`（同一用户 60 秒内最多发一次）。**不删除已有会话**（2026-09-30 / A1）：claim 新密钥、新建一个出站会话并设为首选，reset 经它以 PreKey 消息送达；旧会话继续解密在途消息。「解密成功但内容解析失败」不属于解密失败，见第 13 节。
+- **收到 `session_reset`**：承载该消息的会话（对方刚建立的新会话）在解密时已成为最近使用的会话，之后都用它加密；**其余会话不再丢弃**（A1，对方在 reset 之前发出的消息可能还在途中），按每个对端 5 个的上限自然淘汰。
 - **登录**：每次 `verify_code` 都生成全新的 vodozemac Account，上传 100 个 OTK 和 1 个 fallback key（服务端会清空旧预密钥，并把 device_generation 加 1）。同一用户重新登录时保留本地消息，只清空加密状态。换成另一个用户时清空全部本地数据。
 - **OTK 补充**：在以下时机检查 `GET /v1/keys/count`，数量小于 20 时补到 100：每次 WS 连上、收到 `queue_empty`、每次通过 PreKey 新建入站会话之后。
 - **密钥上传顺序**（登录与补充相同）：持 `crypto_lock` 生成新 OTK / fallback 并**先保存账户**（此时仍是「未发布」），释放锁后 `PUT /v1/keys`，成功后再持锁**重新读取**账户、`mark_keys_as_published` 并写 `fallback_meta`。上传超时（服务端其实已落库）或进程被杀时私钥不会丢；下次补充检查发现账户里仍有未发布的密钥，就原样重传（服务端按 `key_id` 覆盖写入），不再另生成一批。已知残留风险：若服务端已收到那次上传、且在重传前某个 OTK 已被 claim，重传会把它再放回服务端，第二个使用者的 PreKey 将无法解密并触发 session_reset 自愈。上传流程由单独的 `key_upload` 锁串行化；HTTP 请求期间不持有 `crypto_lock`。
@@ -31,11 +31,11 @@
 
 ## 3. 投递、去重、事件
 
-- WS 地址为 `ws(s)://<host>/v1/ws?token=…`，同时带 `Authorization` 头。每 10 秒发一次 `ping`，35 秒收不到任何帧就主动重连（需短于 Android 模拟器等 NAT 约 20 秒的空闲回收）。建连的 TCP、TLS、WS 握手三步各有 15 秒超时。重连采用指数退避，从 1 秒开始、上限 30 秒，每次等待加 ±12.5% 的抖动。
+- WS 地址为 `ws(s)://<host>/v1/ws`，token **只放在 `Authorization` 头**里（B1，不再进 URL）。每 10 秒发一次 `ping`，35 秒收不到任何帧就主动重连（需短于 Android 模拟器等 NAT 约 20 秒的空闲回收）。建连的 TCP、TLS、WS 握手三步各有 15 秒超时。重连采用指数退避，从 1 秒开始、上限 30 秒，每次等待加 ±12.5% 的抖动。
 - 一条信封处理完（解密、去重、落库、发事件）后才会 ack。遇到**临时错误**时不 ack、不记 seen，等待重投：网络错误、未登录，以及服务端 5xx（含 `internal`、无 JSON 错误体的 `http_5xx`）、`rate_limited` / 429、`unauthorized`（见 `HushError::is_transient`）。其他错误（格式错误、无法解密、取对方身份得到 404 等永久错误）先存成「无法解密」占位再 ack，避免同一条消息反复失败。事件同样处理完才 ack，分类规则相同。
 - **未 ack 的数据不会等到下次重连**：服务端在同一连接上不会重发，所以出现网络类失败时核心会在 2 秒后主动 HTTP 拉取一次（同一时间只安排一次；连续失败时延迟翻倍，最长 60 秒，处理成功后复位）。HTTP 拉取本身失败时要求当前 WS 连接立即断开重连，由服务端重发（用 `notify_waiters`，没有活动连接时不留存信号，不会让下一条健康连接一建立就被关掉）。
-- 关闭码 4001（在别处登录）、收到 `logged_out` 帧，按「已登出」处理：清除 token 和加密状态（保留消息），停止后台任务，发出 `LoggedOut{reason}` 事件，不自动重连。
-- **401（C-G）**：任何 REST 接口（经 `Inner::api()` 发出、带 token 的请求）或 WS 握手返回 401，同样处理，`reason = "session_expired"`（服务端令牌 90 天未使用即失效，见 server/API_NOTES.md）。只有返回 401 的请求所用 token 仍是当前登录态时才登出：旧登录态的请求晚到的 401 不会登出新的登录；登录前的接口（没有 token）和 `logout()` 自己的登出请求不触发。多个请求同时 401 只发一次 `LoggedOut`。已知：换设备登录时，旧设备若在收到 4001 之前恰好有 REST 请求被拒，原因会是 `session_expired` 而不是 `logged_in_elsewhere`（服务端对两者都只返回 401）。
+- 关闭码 4001（在别处登录）、收到 `logged_out` 帧，按「已登出」处理：清除 token 和加密状态（保留消息；只有这两种经已认证连接通知的登出才清加密状态），停止后台任务，发出 `LoggedOut{reason}` 事件，不自动重连。
+- **401（C-G）**：任何 REST 接口（经 `Inner::api()` 发出、带 token 的请求）或 WS 握手返回 401：**只清 token、不清加密状态**（B1，加密状态留到下次 `verify_code` 按登录逻辑重建），停止后台任务，`reason = "session_expired"`（服务端令牌 90 天未使用即失效，见 server/API_NOTES.md）。只有返回 401 的请求所用 token 仍是当前登录态时才登出：旧登录态的请求晚到的 401 不会登出新的登录；登录前的接口（没有 token）和 `logout()` 自己的登出请求不触发。多个请求同时 401 只发一次 `LoggedOut`。已知：换设备登录时，旧设备若在收到 4001 之前恰好有 REST 请求被拒，原因会是 `session_expired` 而不是 `logged_in_elsewhere`（服务端对两者都只返回 401）。
 - 关闭码 **4000**（同一账号建立了新连接，本连接被替换）**不是登出**：不清密钥、不发 `LoggedOut`，只发 `ConnectionChanged(Disconnected)`，约 3 秒后重试一次；如果重试的连接再次收到 4000，就停止重连（保持登录，状态 `Disconnected`），等平台再调用 `start()`。这样两个进程共用同一账号时不会互相无限挤占，也不会因为一次竞态丢掉加密状态。
 - WS 连续失败 3 次后，每次重试前用 `GET /v1/messages` 拉取一次作为兜底，处理后调用 `POST /v1/messages/ack`。平台层也可以主动调用 `sync_now()`。
 - **读帧上限**为 `1MB + 64KB`，与服务端推送上限一致。收到超限帧时连接已不可用，而且重连后服务端会重发同一帧，所以不直接重连，而是先用 HTTP 连续拉取（最多 20 页）把积压处理掉并 ack，再按退避重连。
@@ -49,7 +49,7 @@
   - **收件箱（C-H，关闭了原来的崩溃窗口）**：收到的信封（WS 或 HTTP）在去重检查之后先原样写入 `inbox` 表；解密成功时，推进后的棘轮状态（Olm 会话、新建会话时的账户、Megolm 入站会话）与明文（库密钥字段加密，AAD `inbox.plaintext`）在**同一个 SQLite 事务**写入。处理完成（或确定为永久失败）后，在一个事务内记 `env:` seen 并删除该行，然后才 ack。处理某个信封时若收件箱里已有它的明文，就直接用明文继续、不再解密。于是进程在「解密之后、落成消息之前」被杀（或任务被 `stop()` 中止）时：`start()` 在建立 WS 之前先处理残留的收件箱行（按积压处理）；即使服务端先重投、或平台先调了 `sync_now()`，按信封 id 加锁后同样找到保存的明文。不会再出现「无法解密」与误发的 session_reset。ack 语义不变：仍是处理完成才 ack，临时错误不 ack、等服务端重投（已解密的明文留在收件箱，重投时直接使用）。处理本身（`handle_incoming`）不在那个事务里，重放时依赖已有的幂等性（消息按 (发送者, id) 去重、回应 / 回执 / room_key 可重复应用）。`wipe_all` 清空收件箱；`wipe_crypto`（被挤下线、同账号重新登录）只删除尚未解密的行（它们已无法用新的加密状态解开），已解密的行保留、登录后继续处理。
   - **并发**：WS 与 `sync_now()` 可能同时拿到同一信封。处理按信封 id 加锁，「查 seen → 解密处理 → 记 seen」在同一临界区内；后到者等前者处理完，看到已处理就直接 ack，不会重复解密（重复解密会失败并误触发 session_reset）。
   - **事件**同样按事件 id 加锁并记入 `seen`（键 `evt:<id>`），重投或 WS/HTTP 同时拿到时只处理一次（避免重复插入「X 加入了群聊」之类的系统消息）。网络类临时错误不记 seen。
-- **会话归属**：经 Megolm 收到的内容属于该群。经 Olm 收到的内容如果带 `group_id`，并且发送者是该群成员，就归入群会话（例如群消息的回执），否则归入单聊。
+- **会话归属**（A4）：经 Megolm 收到的内容属于该群；经 Olm 收到的内容一律属于与发送者的单聊，不看 `Content.group_id`（群消息的回执按消息 id 定位，room_key 单独处理，都不依赖会话归属）。
 
 ## 4. 消息语义
 
@@ -90,7 +90,7 @@
 ## 7. 本地存储
 
 - 数据库文件是 `data_dir/hush.sqlite`（WAL 模式）。库密钥必须是 32 字节。首次打开时写入一个校验值，以后用错误的密钥打开会直接报错，避免写乱数据。
-- **表结构迁移**按 `PRAGMA user_version` 进行（`store/mod.rs` 的 `MIGRATIONS`，下标 + 1 即版本号，只允许在末尾追加）。迁移分两种：`Sql`（不需要库密钥）和 `Data`（要解密 / 重新加密已有数据）。打开顺序：v0 的库先执行 v1 建表 → **校验库密钥**（不符返回 `KeyMismatch`，此时不执行任何后续迁移、不改写数据）→ 执行其余迁移。当前版本为 **4**：
+- **表结构迁移**按 `PRAGMA user_version` 进行（`store/mod.rs` 的 `MIGRATIONS`，下标 + 1 即版本号，只允许在末尾追加）。迁移分两种：`Sql`（不需要库密钥）和 `Data`（要解密 / 重新加密已有数据）。打开顺序：v0 的库先执行 v1 建表 → **校验库密钥**（不符返回 `KeyMismatch`，此时不执行任何后续迁移、不改写数据）→ 执行其余迁移。当前版本为 **5**（v5 见第 13 节）：
   - v1：引入迁移框架前的完整表结构（全部 `IF NOT EXISTS`），旧库（`user_version=0`）打开时无损升级。
   - v2：`inbox(envelope_id, envelope, plaintext, received_at)`（C-H）。
   - v3（数据迁移）：旧通话记录补上结束原因（C-B，规则见第 6 节）；正文无法解密的行跳过（读取时兜底）。这一步要把每条消息正文解密一次（逐行进行，内存只保留要改写的通话记录），升级后首次打开会慢一些，消息很多时平台应在后台线程打开库。
@@ -104,7 +104,7 @@
   - `search_user_by_email` 返回合并后的资料（带上缓存里的邮箱，与 `cached_profile` 一致）。群成员列表只有 user_id，不写资料缓存。
 - 加密的字段：消息正文与引用（整条 JSON，其中含附件 key 和 digest），用 AES-256-GCM 加密，AAD 为字段标签；登录态（token）和设置，同样 AES-GCM 加密；vodozemac 的 Account、Session、GroupSession、InboundGroupSession pickle，用 vodozemac 自带的 pickle 加密，密钥也是库密钥。
 - 明文存储的字段：会话元数据（时间、未读数、置顶等）、资料缓存、群信息、回应 emoji、消息时间戳与状态、身份公钥。
-- `logout()` 会调用服务端登出、停止后台任务、清空全部本地数据和 `files/`。
+- `logout()` 会调用服务端登出、停止后台任务、清空全部本地数据和 `files/`，然后 `wal_checkpoint(TRUNCATE)` + `VACUUM`（B8）。库以 `secure_delete=ON` 打开。
 
 ## 8. 与设计文档第 5 节的差异
 
@@ -140,7 +140,7 @@
 - 只支持单设备（与契约一致）。
 - 挂起的群消息如果一直收不到 room_key，就一直挂起，UI 不可见，也没有超时占位。
 - 群消息状态只要任一成员回执就会更新。每个成员各自的已读情况没有对外暴露。
-- 本地搜索会逐条解密后做子串匹配，消息量很大时较慢。
+- 本地搜索没有索引：逐条解密后做子串匹配。已改为流式、够 200 条即停、不为缩略图分配内存（C2），但**未命中**时仍要解密全部消息（10 万条约 0.25 秒，带大缩略图的附件更慢），平台应使用 `search_messages_async`。
 - 通话跟踪只存在内存里，进程重启后进行中的通话不会生成通话记录。
 - 下载后的附件以明文缓存在 `files/`，依赖平台的文件保护（Android 应用私有目录、iOS Data Protection）。
 - 附件上传和下载没有进度回调。v2 附件流式处理，内存与大小无关；v1 旧附件下载时仍整文件解密（约一份文件大小）。附件收发需要约两份文件大小的临时磁盘空间（明文副本 / 缓存 + 密文临时文件）。
@@ -191,3 +191,76 @@
 测试：`store/tests.rs`（构造 v3 旧库 → 打开 → sort_ts 回填、重复值错开、失败消息不动、数据完好；mark_sent 之后逐页翻完不漏不重；草稿加密与排序；删除会话）、`content.rs`（UTF-16 区间校验、未知字段）、`client/messaging.rs`（删除群会话后附件文件被删、群有新消息时重新出现；草稿；提及计数与 mark_read 清零；发送侧区间校验；转发复用密文、独立缓存路径、失败语义）、`client/sync.rs`（邮箱缓存不被搜索和事件改写）、`tests/e2e.rs::e2e_v3_polish`（真实服务端：K2；单聊双方、群三方顺序一致且 sort_ts = server_ts；@提及计数与 `mentions_me`；转发附件复用密文 id、接收方下载解密成功、不存在的群那一条为 failed；草稿；删除群会话后重新出现）。
 
 示例机器人（`examples/bot.rs`）：群消息 `mentions_me` 为 true 时回复「@对方 收到@」并提及对方，便于两端联调 @提及。
+
+## 13. 2026-09-30 审查修复（`docs/audit/2026-09-30-core.md`）
+
+### 13.1 新增导出（只有新增；已有函数、类型、字段的签名与语义未动，前后绑定对比无删除行）
+
+| 导出 | 说明 |
+|---|---|
+| `HushClient.set_allow_insecure_http(allow: bool)` | B1 调试开关：允许对**公网**地址用明文 http。默认 false，不持久化。本机 / 内网地址不需要它。 |
+| `HushClient.search_messages_async(query) -> Vec<MessageItem>`（async） | C2：`search_messages` 的异步版本，在核心的阻塞线程池执行，结果相同。 |
+| `fn set_log_listener(listener: LogListener)`（顶层函数） | D-P0 日志出口，进程内全局。 |
+| `callback interface LogListener { on_log(level: LogLevel, module: String, message: String) }` | 在 `hushcore-log` 线程回调。 |
+| `enum LogLevel { Error, Warn, Info, Debug }` | |
+
+导出枚举（`AttachmentKind`、`CallAction`、`MessageBody`、`CoreEvent` 等）**没有加变体**，两端的 `when` / `switch` 不需要改。
+
+### 13.2 A 类
+
+| 编号 | 修复方式 | 行为变化 |
+|---|---|---|
+| A1 | ① 解密失败不删旧会话：`send_session_reset` claim 新密钥、新建出站会话并设为首选，reset 经它发出；收到 reset 也不再丢弃其余会话。② 解密成功但 `Content` 解析失败：类型是 text / attachment（或看不出类型）时存一条 `System{"[不支持的消息，请升级]"}`（`sender_id` = 发送者，计未读，id 取内容自带的 id，取不到用信封 id）；已知的不可见控制内容结构对不上时直接忽略。不发 reset、不计「无法解密」。③ 未知枚举值在 wire 层兜底：附件 `kind` 未知 → `File`；通话 `action` 未知 → 忽略该信令；回执 `kind`、输入状态 `action` 未知 → 忽略；服务端群角色未知 → `Member`。④ 按消息 id 的重传请求未做。 | 平台会看到 `sender_id` 非空的 `System` 消息（不支持的消息）。 |
+| A2 | `parse_envelope` 要求 `from`（群消息还有 `group_id`）是 36 字符 UUID，否则确认丢弃；`Store::ensure_conv` 拒绝 `u:` / `g:` 这类 id；`conversations()` 单个会话读不出来时跳过并记日志；v5 迁移删除已存在的坏会话及其消息、回应、草稿。 | |
+| A3 | `Store::modify_message(id, f)`：库锁内读出最新的行 → 修改 → 只写会变的列；`update_message`（整行写回）已删除。回执、重发、发送失败、撤回、上传结果、下载路径都改用它；`mark_read` 是一条 UPDATE，只改 read / status / expires_at。 | |
+| A4 | 见第 3 节「会话归属」。 | 成员经 Olm 私发、带 `group_id` 的可见内容进单聊，不再进群。 |
+| A5 | `timer` 内容的变更时间取信封 `server_ts`（没有时才用自报值，且不超过当前时间）；本端 `set_disappearing` 记 `deliver` 返回的服务端时间；普通消息里自报的 `expire_set_at` 若晚于该消息 `server_ts` + 5 分钟则视为不可信，不参与同步。 | 已知残留：旧版本、时钟偏快的对端在**过去**设置的时间仍带着偏差参与比较（偏差 ≤ 其时钟误差）。 |
+| A6 | 信封 `server_ts`、消息 `sort_ts`、会话 `last_ts`、`mark_sent` 的服务端时间都钳到「当前时间 + 1 天」以内，负数视为 0；`free_sort_ts` 用饱和加法。v5 迁移把已被顶到未来的会话时间拉回。 | |
+| A7 | 收到的引用按 `(id, author)` 在本会话查本地消息：找到用本地预览文本（≤200 字），找不到标「原消息不可用」；对方给的引用文本不入库。 | 本地没有原消息（清空过、入群前的消息）时引用显示「原消息不可用」。 |
+| A8 | `megolm_in.seen_idx` 记录每个入站会话已处理的消息序号（区间表示，最多 64 段）；解密后发现序号已处理过即丢弃。与棘轮状态、收件箱明文同一事务写入。 | 升级前处理过的序号没有记录。挂起的群消息在解密后、落库前遇到临时错误（只可能是此刻已登出）再重试时会被当作重放丢弃。 |
+| A9 | 撤回窗口 = 撤回信封的 `server_ts` − 原消息的 `server_ts`（本地没有时用 `sort_ts`）≤ 24 小时 + 5 分钟，不看自报的 `Content.ts`。 | |
+| A10 | `unread_count` 改为实时统计（未读、收到、未撤回的消息数，部分索引 `messages_unread`）；`conversations.unread` 列不再读取。 | 删除、撤回、阅后即焚掉未读消息后未读数回落（以前不回落）。 |
+| A11 | 群 room_key 分发用的 claim 加负缓存：403 / 404 后 5 分钟内不再为该成员 claim（内存中；对端换钥、成为好友、本端重新登录时清除）。单聊发送不走负缓存。 | |
+
+### 13.3 B 类
+
+| 编号 | 修复方式 | 行为变化 |
+|---|---|---|
+| B1 | `api::normalize_base` / `ensure_secure`：公网地址只允许 https；回环、RFC1918、链路本地、100.64/10、IPv6 ULA / 链路本地，以及 `localhost`、单标签主机名、`.local` / `.lan` / `.internal` / `.home.arpa` 允许 http。没写协议时内网补 `http://`、公网补 `https://`。`Inner::api()`、WS 循环、`logout()` 对已保存的登录态同样检查。WS token 只放头部。401 只清 token。 | **影响两端**：公网 `http://` 地址登录返回 `InvalidInput`；旧版本保存的公网 http 登录态，所有接口返回 `InvalidInput`（不会自动登出），需改用 https 重新登录或调用 `set_allow_insecure_http(true)`。`10.0.2.2`、`127.0.0.1`、局域网 IP 不受影响。401 后账户密钥与会话还在库里，直到重新登录。 |
+| B2 | v1 附件 `size` > 25MB 拒绝下载；下载量上限 = 按 `size` 与 `format` 算出的密文长度 + 64KiB，超过即中止；`size` > 100MB 或未知格式直接拒绝。明文媒体（头像、朋友圈图片）下载上限 25MB。 | 超限时 `download_attachment` 返回 `InvalidInput`。 |
+| B3 | `safe_file_name` 按 UTF-8 字节截到 150 字节（整字符边界）并保留 ≤16 字节的扩展名。 | 超长文件名的缓存路径与旧版本不同（只影响新下载）。 |
+| B4 | 上传结束写回时发现消息已被本地删除或撤回，就不发送，`send_attachment` / `resend` 返回 `InvalidInput`。 | `delete_local` 可当「取消发送」用；已上传的密文留在服务端到期回收。没有单独的取消接口与进度回调。 |
+| B5 | 密钥上传成功后 `/v1/me` 失败：`verify_code` 仍返回成功，资料用本地缓存或只有 id 的空资料。 | |
+| B6 | WS 帧放进 64 帧的有界队列，由同一任务里并发轮询的处理器按序处理；读写、心跳不被处理挡住；有帧在处理时不做空闲判断；重连通知的等待者在连接建立时登记。连接断开后把已读到的帧处理完再重连。 | |
+| B8 | `secure_delete=ON`；登出后 `wal_checkpoint(TRUNCATE)` + `VACUUM`。 | |
+
+未做：B7（群成员表由服务端决定、已核验联系人换钥后不阻断发送）、B8 中的资料缓存 / 群成员 / `seen` 表明文与 Content padding——记为已知限制。
+
+### 13.4 C 类（macOS arm64，release、opt-level=3；`src/client/perf_tests.rs`，运行方式见文件头）
+
+| 项 | 修复方式 | 修复前 | 修复后 |
+|---|---|---|---|
+| C1 同一时间戳插入 | `free_sort_ts` 最多探测 32 个位置，仍被占用就排到会话最后一条之后 | 1000 / 2000 / 5000 / 10000 条：1.02s / 4.12s / 21.1s / 54.0s | 69ms / 137ms / 331ms / 615ms（不同时间戳对照 38–313ms） |
+| C2 搜索 | 按 rowid 分批（500 条）流式扫描，批间释放库锁；只解析正文 / 说明 / 文件名；够 200 条即停；新增 async 版本 | 10 万条命中 255ms、未命中 278ms；5 万条带 8KB 缩略图的附件 4.5s、RSS +1261MB | 命中即停 1ms；未命中 234–272ms（解密为主，未变）；带缩略图 3.1–4.5s、RSS +7MB |
+| C3 积压 | 送达回执按（发送者, 群）攒批，250ms 后一次发出；刷新类事件去抖；事件队列上限 4096 | 3000 条：6008 个事件、3000 次 POST、6 次 claim；100 条：206 个事件、100 次 POST、4 次 claim | 3000 条：3006 个事件、2 次 POST、1 次 claim；100 条：103 个事件、1 次 POST、1 次 claim |
+| C4 `mark_read` | 单条 UPDATE + 部分索引（`INDEXED BY messages_unread`） | 5000 未读 128ms、5001 个事件；10 万已读 0 未读 7.6ms | 17ms、1 个事件；13µs |
+| C5 删除 / 清空会话 | `has_files` 列 + 部分索引，只读有本地文件的消息 | 10 万条 378ms / 389ms | 149ms / 172ms（剩下的是删除本身，含 `secure_delete`） |
+
+行为变化（影响两端）：
+- **搜索**：附件不再匹配「[图片]」「[文件]」这类占位文字，只匹配说明与文件名；结果取最近写入的 200 条命中，按 `sort_ts` 从新到旧。
+- **`mark_read`**：不再为每条消息发 `MessageUpdated`，只给开始计时的阅后即焚消息发，外加一个 `ConversationsChanged`。
+- **送达回执**延迟约 250ms 发出。
+- **事件**：`ConversationsChanged` / `FriendsChanged` / `GroupsChanged` 去抖——没有其他待投递事件时立即投递，事件不断时每种最多 100ms 一次、最后补投一次，不保证与 `emit` 次数一一对应。待投递事件超过 4096 时丢弃最早的积压 `MessageAdded` / `MessageUpdated` / `MessageRemoved` / `Typing`，随后一定有一个 `ConversationsChanged`，平台应据此重新读取。
+- 同一毫秒连续超过 32 条的消息，`sort_ts` 不再紧挨原时间戳，而是排到会话末尾（到达顺序不变）。
+
+### 13.5 日志出口（D-P0）
+
+`set_log_listener` 首次调用时安装全局 tracing subscriber，只转发 target 以 `hushcore` 开头的 error / warn / info / debug 日志；不调用时不安装，行为与之前一致。进程里已有别的全局 subscriber 时不生效。回调经上限 1024 的队列在 `hushcore-log` 线程执行，满了丢弃新日志。日志文本含用户 / 群 / 消息 id、错误码与错误描述，不含消息明文、密钥、token；解析已解密内容失败时只记错误类别，不记 serde 的错误原文。
+
+### 13.6 本地库 v5
+
+`messages.has_files` 列（迁移时逐行解密回填）、部分索引 `messages_unread` / `messages_files`、`megolm_pending(sender, session_id)` 索引、`megolm_in.seen_idx` 列；删除无法解析的会话 id 及其数据；把超过「当前 + 1 天」的会话时间拉回；旧未读计数为 0 的会话里残留的 `read=0` 行补成已读。回填要解密每条消息一次，升级后首次打开较慢（与 v3 相同量级）。
+
+### 13.7 测试
+
+`client/audit_tests.rs`（A1–A11，修复前全部失败）、`store/tests.rs`（v4 旧库 → 打开 → 数据完好；`modify_message`；同一时间戳插入；搜索；序号区间）、`content.rs`（未知枚举值）、`api.rs` / `ws.rs` / `client/account.rs`（B1、B5、B8）、`util.rs`（B3）、`client/attachments.rs`（B2、B4）、`client/sync.rs`（B6、信封校验）、`client/mod.rs`（事件去抖与上限、回执攒批）、`logging.rs`、`tests/e2e.rs::audit_fixes` 与 401 后重新登录。

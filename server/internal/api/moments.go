@@ -2,7 +2,7 @@ package api
 
 import (
 	"errors"
-	"log"
+	"hush/server/internal/logx"
 	"net/http"
 	"unicode/utf8"
 
@@ -15,6 +15,11 @@ const (
 	maxMomentMedia  = 9
 	maxCommentText  = 1000
 	maxVisibleUsers = 5000
+	// 图片宽高的上限（像素）。0 表示未知；负数与离谱的大数没有意义，只会让客户端按错误的比例排版。
+	maxMediaDimension = 20000
+	// 同一个人对同一条动态的评论通知，在接收方队列里最多保留最新的这么多条事件
+	// （通知本身都在 moment_notifications 表里，客户端可以通过接口拉全）。
+	commentEventKeep = 3
 )
 
 // hydrateOne 把单条动态组装为查看者视角的 Moment。
@@ -49,10 +54,13 @@ func (s *Server) handleCreateMoment(w http.ResponseWriter, r *http.Request, uid 
 		return
 	}
 	for _, m := range req.Media {
-		if _, err := s.st.GetAttachment(r.Context(), m.AttachmentID); err != nil {
-			storeErr(w, r, err, "图片附件不存在: "+m.AttachmentID)
+		if m.AttachmentID == "" || m.Width < 0 || m.Height < 0 || m.Width > maxMediaDimension || m.Height > maxMediaDimension {
+			fail(w, codeBadRequest, "图片的 attachment_id / width / height 无效（宽高须在 0–20000 之间）")
 			return
 		}
+	}
+	if !s.allowWrite(w, uid, "moment") {
+		return
 	}
 	vis := store.Visibility{Mode: store.VisAll}
 	if req.Visibility != nil {
@@ -73,8 +81,15 @@ func (s *Server) handleCreateMoment(w http.ResponseWriter, r *http.Request, uid 
 		fail(w, codeBadRequest, "visibility.mode 须为 all/include/exclude")
 		return
 	}
-	row, err := s.st.CreateMoment(r.Context(), uid, req.Text, req.Media, vis)
-	if err != nil {
+	row, err := s.st.CreateMoment(r.Context(), uid, req.Text, req.Media, vis, s.set().MomentsPerDay)
+	switch {
+	case errors.Is(err, store.ErrRateLimited):
+		fail(w, codeRateLimited, "今天发布的动态太多了，请明天再试")
+		return
+	case errors.Is(err, store.ErrNotFound):
+		fail(w, codeNotFound, "图片附件不存在（只能使用自己上传的附件）")
+		return
+	case err != nil:
 		internalErr(w, r, err)
 		return
 	}
@@ -83,7 +98,7 @@ func (s *Server) handleCreateMoment(w http.ResponseWriter, r *http.Request, uid 
 		internalErr(w, r, err)
 		return
 	}
-	log.Printf("[moments] user=%s 发布动态 %s（%s，%d 图）", uid, row.ID, vis.Mode, len(req.Media))
+	logx.Debugf("[moments] user=%s 发布动态 %s（%s，%d 图）", uid, row.ID, vis.Mode, len(req.Media))
 	ok(w, m)
 }
 
@@ -163,7 +178,7 @@ func (s *Server) handleDeleteMoment(w http.ResponseWriter, r *http.Request, uid 
 		internalErr(w, r, err)
 		return
 	}
-	log.Printf("[moments] user=%s 删除动态 %s", uid, row.ID)
+	logx.Debugf("[moments] user=%s 删除动态 %s", uid, row.ID)
 	ok(w, obj{})
 }
 
@@ -174,11 +189,12 @@ func notifyMoment(t *store.Tx, n store.NotificationInsert) error {
 		return err
 	}
 	// 点赞通知按（动态, 点赞者）合并：反复点赞/取消点赞不会在对方队列里堆积事件（取消点赞时通知本身也已删除）。
-	key := ""
 	if n.Kind == "like" {
-		key = "moment_like:" + n.MomentID + ":" + n.FromID
+		return ws.Emit(t, []string{n.UserID}, "moment_notification", "moment_like:"+n.MomentID+":"+n.FromID, obj{"notification": notif})
 	}
-	return ws.Emit(t, []string{n.UserID}, "moment_notification", key, obj{"notification": notif})
+	// 评论通知按（动态, 评论者）限量：反复评论不能无限占用对方的队列
+	return ws.Emit(t, []string{n.UserID}, "moment_notification", "moment_comment:"+n.MomentID+":"+n.FromID,
+		obj{"notification": notif}, ws.EmitOpt{Keep: commentEventKeep})
 }
 
 // POST /v1/moments/{id}/like → {}
@@ -286,7 +302,7 @@ func (s *Server) handleComment(w http.ResponseWriter, r *http.Request, uid strin
 		internalErr(w, r, err)
 		return
 	}
-	log.Printf("[moments] user=%s 评论动态 %s", uid, row.ID)
+	logx.Debugf("[moments] user=%s 评论动态 %s", uid, row.ID)
 	ok(w, store.Comment{ID: c.ID, Author: me.Profile, ReplyTo: replyTo, Text: c.Text, CreatedAt: c.CreatedAt})
 }
 
@@ -295,6 +311,9 @@ func replyVisible(t *store.Tx, target, commenter, momentID string) (bool, error)
 	if _, err := t.VisibleMoment(target, momentID); errors.Is(err, store.ErrNotFound) {
 		return false, nil
 	} else if err != nil {
+		return false, err
+	}
+	if blocked, err := t.BlockedEither(target, commenter); err != nil || blocked {
 		return false, err
 	}
 	return t.AreFriends(target, commenter)

@@ -2,11 +2,15 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"hush/server/internal/mail"
+	"hush/server/internal/metrics"
+	"hush/server/internal/netx"
 	"hush/server/internal/store"
 	"hush/server/internal/ws"
 )
@@ -21,7 +25,7 @@ type Config struct {
 
 	TurnSecret string
 	TurnPort   int           // 实际在运行的 TURN 端口；0 表示 TURN 不可用（/v1/calls/turn 返回空 urls）
-	TurnTTL    time.Duration // 默认 24h
+	TurnTTL    time.Duration // TURN 凭证有效期，默认 6h
 
 	MaxAttachmentBytes int64 // 默认 100MB（测试可调小）
 
@@ -42,6 +46,30 @@ type Config struct {
 	QueueMaxBytes    int64         // 每个接收方队列最多负载字节，默认 200MB
 	DailyUploadBytes int64         // 每用户 24 小时内上传附件总量，默认 2GB
 	BlobTimeout      time.Duration // 附件上传/下载路由的读写超时，默认 10 分钟
+
+	// 以下为管理后台相关（2026-09-30），零值即现有行为：开放注册、不限邮箱域名。
+	RegistrationMode string   // RegOpen（默认）| RegInvite | RegClosed
+	EmailDomains     []string // 新用户邮箱域名白名单；空表示不限
+	ReportsPerHour   int      // POST /v1/reports 每用户每小时次数，默认 20
+	BackupKeep       int      // 在线备份保留份数，默认 7
+
+	// 发送侧限速与子配额（2026-09-30 缺陷修复 A1 / A2 / A5），零值取默认。
+	SendOlmPerMinute    int   // 每用户每分钟单聊信封数（按接收方条目计），默认 3000
+	SendGroupPerMinute  int   // 每用户每分钟群消息数，默认 300
+	SendBytesPerMinute  int64 // 每用户每分钟消息正文字节，默认 64MB
+	SenderQueueMaxItems int64 // 单个发送方在某接收方队列里的上限，默认 1000 条
+	SenderQueueMaxBytes int64 // 默认 20MB
+	SearchPerMinute     int   // 每用户每分钟按邮箱搜索次数，默认 20
+	MomentsPerDay       int   // 每用户 24 小时发布朋友圈条数，默认 200
+
+	// 资源上限（P5）。
+	MaxInflight int // 同时处理的普通请求数上限（不含 WebSocket 与附件上传下载），超出返回 503；默认 1024
+	MaxUploads  int // 同时进行的附件上传数上限，超出返回 503；默认 32
+
+	// TrustedProxies 是可信反向代理的地址段；配置后才采信它们写的 X-Forwarded-For（B1）。nil 表示直接对外。
+	TrustedProxies *netx.Proxies
+
+	Metrics *metrics.Registry // nil 时内部新建
 }
 
 // 默认配额。
@@ -57,6 +85,19 @@ const (
 	DefaultWritesPerMinute          = 30
 	DefaultAuthCodePerIPPerMinute   = 10
 	DefaultAuthVerifyPerIPPerMinute = 30
+	DefaultReportsPerHour           = 20
+	DefaultBackupKeep               = 7
+
+	DefaultSendOlmPerMinute    = 3000
+	DefaultSendGroupPerMinute  = 300
+	DefaultSendBytesPerMinute  = 64 << 20
+	DefaultSenderQueueMaxItems = 1000
+	DefaultSenderQueueMaxBytes = 20 << 20
+	DefaultSearchPerMinute     = 20
+	DefaultMomentsPerDay       = 200
+	DefaultMaxInflight         = 1024
+	DefaultMaxUploads          = 32
+	DefaultTurnTTL             = 6 * time.Hour
 )
 
 // Server 持有全部 handler 依赖。
@@ -70,13 +111,55 @@ type Server struct {
 	uploads       *uploadReservations
 
 	authCodeLimiter, authVerifyLimiter *windowLimiter
+	reportLimiter                      *windowLimiter
+	sendOlmLimiter, sendGroupLimiter   *windowLimiter
+	sendBytesLimiter                   *windowLimiter
+	searchLimiter                      *windowLimiter
+
+	inflight chan struct{} // 普通请求的并发名额
+	uploads2 chan struct{} // 附件上传的并发名额
+
+	defaults Settings                 // 启动参数决定的默认值
+	live     atomic.Pointer[Settings] // 当前生效的设置（后台可在线修改）
+	draining atomic.Bool
+	stats    *statsRecorder
+	metrics  *metrics.Registry
+	handler  http.Handler
 }
 
 // New 构造完整的 http.Handler（含日志与统一错误体）。
-func New(cfg Config) http.Handler {
+func New(cfg Config) http.Handler { return NewServer(cfg).Handler() }
+
+// Handler 返回完整的 http.Handler。
+func (s *Server) Handler() http.Handler { return s.handler }
+
+// Metrics 返回请求指标表。
+func (s *Server) Metrics() *metrics.Registry { return s.metrics }
+
+// NewServer 构造 Server（管理后台需要它来读取 / 修改在线设置、读取指标）。
+func NewServer(cfg Config) *Server {
 	if cfg.TurnTTL == 0 {
-		cfg.TurnTTL = 24 * time.Hour
+		cfg.TurnTTL = DefaultTurnTTL
 	}
+	defInt := func(v *int, d int) {
+		if *v <= 0 {
+			*v = d
+		}
+	}
+	def64 := func(v *int64, d int64) {
+		if *v <= 0 {
+			*v = d
+		}
+	}
+	defInt(&cfg.SendOlmPerMinute, DefaultSendOlmPerMinute)
+	defInt(&cfg.SendGroupPerMinute, DefaultSendGroupPerMinute)
+	def64(&cfg.SendBytesPerMinute, DefaultSendBytesPerMinute)
+	def64(&cfg.SenderQueueMaxItems, DefaultSenderQueueMaxItems)
+	def64(&cfg.SenderQueueMaxBytes, DefaultSenderQueueMaxBytes)
+	defInt(&cfg.SearchPerMinute, DefaultSearchPerMinute)
+	defInt(&cfg.MomentsPerDay, DefaultMomentsPerDay)
+	defInt(&cfg.MaxInflight, DefaultMaxInflight)
+	defInt(&cfg.MaxUploads, DefaultMaxUploads)
 	if cfg.MaxAttachmentBytes <= 0 {
 		cfg.MaxAttachmentBytes = MaxAttachmentSize
 	}
@@ -110,15 +193,94 @@ func New(cfg Config) http.Handler {
 		authCodeLimiter:   newWindowLimiter(cfg.AuthCodePerIPPerMinute, time.Minute),
 		authVerifyLimiter: newWindowLimiter(cfg.AuthVerifyPerIPPerMinute, time.Minute),
 		uploads:           &uploadReservations{reserved: map[string]int64{}}}
+	if cfg.RegistrationMode == "" {
+		cfg.RegistrationMode = RegOpen
+	}
+	if cfg.ReportsPerHour <= 0 {
+		cfg.ReportsPerHour = DefaultReportsPerHour
+	}
+	if cfg.BackupKeep <= 0 {
+		cfg.BackupKeep = DefaultBackupKeep
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.New()
+	}
+	s.cfg = cfg
+	s.reportLimiter = newWindowLimiter(cfg.ReportsPerHour, time.Hour)
+	s.sendOlmLimiter = newWindowLimiter(cfg.SendOlmPerMinute, time.Minute)
+	s.sendGroupLimiter = newWindowLimiter(cfg.SendGroupPerMinute, time.Minute)
+	s.sendBytesLimiter = newWindowLimiter(0, time.Minute)
+	s.searchLimiter = newWindowLimiter(cfg.SearchPerMinute, time.Minute)
+	s.inflight = make(chan struct{}, cfg.MaxInflight)
+	s.uploads2 = make(chan struct{}, cfg.MaxUploads)
+	s.stats = newStatsRecorder()
+	s.metrics = cfg.Metrics
+	s.defaults = Settings{
+		RegistrationMode: cfg.RegistrationMode, EmailDomains: cfg.EmailDomains,
+		ClaimPerMinute: cfg.ClaimPerMinute, WritesPerMinute: cfg.WritesPerMinute,
+		AuthCodePerIPPerMinute: cfg.AuthCodePerIPPerMinute, AuthVerifyPerIPPerMinute: cfg.AuthVerifyPerIPPerMinute,
+		ReportsPerHour:   cfg.ReportsPerHour,
+		SendOlmPerMinute: cfg.SendOlmPerMinute, SendGroupPerMinute: cfg.SendGroupPerMinute, SendBytesPerMinute: cfg.SendBytesPerMinute,
+		SearchPerMinute: cfg.SearchPerMinute, MomentsPerDay: cfg.MomentsPerDay,
+		SenderQueueMaxItems: cfg.SenderQueueMaxItems, SenderQueueMaxBytes: cfg.SenderQueueMaxBytes,
+		QueueMaxItems: cfg.QueueMaxItems, QueueMaxBytes: cfg.QueueMaxBytes, DailyUploadBytes: cfg.DailyUploadBytes,
+		TokenTTL: cfg.TokenTTL, BackupKeep: cfg.BackupKeep,
+	}
+	s.ApplySettings(s.defaults)
 	mux := http.NewServeMux()
 	s.routes(mux)
-	return logRequests(jsonFallback(mux))
+	s.handler = logRequests(s.limitInflight(jsonFallback(mux)), s.metrics)
+	return s
 }
+
+// limitInflight 限制同时处理的请求数：名额用完时立刻返回 503（带 Retry-After），而不是让请求无限堆积、把内存和数据库拖垮。
+// WebSocket（长连接，另有连接数上限）、附件上传下载（耗时长，上传另有并发上限）、健康检查不占名额。
+func (s *Server) limitInflight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/v1/ws" || p == "/healthz" || p == "/readyz" || len(p) >= 15 && p[:15] == "/v1/attachments" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		select {
+		case s.inflight <- struct{}{}:
+			defer func() { <-s.inflight }()
+			next.ServeHTTP(w, r)
+		default:
+			s.metrics.Add("overload_rejected", 1)
+			overloaded(w)
+		}
+	})
+}
+
+func overloaded(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	fail(w, codeUnavailable, "服务器繁忙，请稍后重试")
+}
+
+// handleReady 是就绪探针：查一次数据库。/healthz 只表示进程活着，/readyz 表示能正常服务（停机过程中返回 503）。
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if s.draining.Load() {
+		fail(w, codeUnavailable, "正在停机")
+		return
+	}
+	if err := s.st.Ping(ctx); err != nil {
+		fail(w, codeUnavailable, "数据库不可用")
+		return
+	}
+	writeJSON(w, http.StatusOK, obj{"ok": true})
+}
+
+// SetDraining 标记服务端正在停机：/readyz 开始返回 503，负载均衡器据此摘流。
+func (s *Server) SetDraining() { s.draining.Store(true) }
 
 func (s *Server) routes(mux *http.ServeMux) {
 	h := func(pattern string, fn authed) { mux.Handle(pattern, s.auth(fn)) }
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, obj{"ok": true}) })
+	mux.HandleFunc("GET /readyz", s.handleReady)
 
 	// 3.1 账号
 	mux.HandleFunc("POST /v1/auth/code", s.handleRequestCode)
@@ -183,4 +345,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	// 3.9 通话
 	h("GET /v1/calls/turn", s.handleTurn)
+
+	// 举报与系统公告（管理后台 A10 / A12）
+	h("POST /v1/reports", s.handleReport)
+	h("GET /v1/announcements", s.handleAnnouncements)
 }

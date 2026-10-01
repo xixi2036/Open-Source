@@ -28,7 +28,7 @@ pub fn encrypt(s: &mut GroupSession, plaintext: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 pub fn decrypt(s: &mut InboundGroupSession, bytes: &[u8]) -> Result<Vec<u8>> {
-    decrypt_detailed(s, bytes).map_err(|e| match e {
+    decrypt_detailed(s, bytes).map(|(p, _)| p).map_err(|e| match e {
         MegolmDecryptError::UnknownIndex { first_known, index } => {
             HushError::crypto(format!("Megolm 解密失败: 消息序号 {index} 早于已知的 {first_known}"))
         }
@@ -43,9 +43,10 @@ pub enum MegolmDecryptError {
     Other(String),
 }
 
-pub fn decrypt_detailed(s: &mut InboundGroupSession, bytes: &[u8]) -> std::result::Result<Vec<u8>, MegolmDecryptError> {
+/// 解密，返回 (明文, 消息序号)。序号用来识别被重放的密文（A8）。
+pub fn decrypt_detailed(s: &mut InboundGroupSession, bytes: &[u8]) -> std::result::Result<(Vec<u8>, u32), MegolmDecryptError> {
     let msg = MegolmMessage::from_bytes(bytes).map_err(|e| MegolmDecryptError::Other(format!("Megolm 消息解析失败: {e}")))?;
-    s.decrypt(&msg).map(|d| d.plaintext).map_err(|e| match e {
+    s.decrypt(&msg).map(|d| (d.plaintext, d.message_index)).map_err(|e| match e {
         DecryptionError::UnknownMessageIndex(first_known, index) => MegolmDecryptError::UnknownIndex { first_known, index },
         other => MegolmDecryptError::Other(format!("Megolm 解密失败: {other}")),
     })
@@ -95,14 +96,14 @@ mod tests {
         let mut late = inbound_from_key(&k2).unwrap();
         assert_eq!(late.first_known_index(), 2);
         assert_eq!(decrypt_detailed(&mut late, &m0), Err(MegolmDecryptError::UnknownIndex { first_known: 2, index: 0 }));
-        assert_eq!(decrypt_detailed(&mut late, &m2).unwrap(), b"m2");
+        assert_eq!(decrypt_detailed(&mut late, &m2).unwrap(), (b"m2".to_vec(), 2));
 
         // 更早的密钥后到：应替换
         let mut early = inbound_from_key(&k0).unwrap();
         let mut merged = better_inbound(&mut late, &mut early).expect("更早的密钥应胜出");
         assert_eq!(merged.first_known_index(), 0);
-        assert_eq!(decrypt_detailed(&mut merged, &m0).unwrap(), b"m0");
-        assert_eq!(decrypt_detailed(&mut merged, &m1).unwrap(), b"m1");
+        assert_eq!(decrypt_detailed(&mut merged, &m0).unwrap().0, b"m0");
+        assert_eq!(decrypt_detailed(&mut merged, &m1).unwrap().0, b"m1");
 
         // 反过来：更晚的密钥不替换更早的
         let mut early2 = inbound_from_key(&k0).unwrap();

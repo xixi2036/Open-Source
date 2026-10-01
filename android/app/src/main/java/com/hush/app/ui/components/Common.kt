@@ -97,6 +97,7 @@ fun SettingsGroup(title: String? = null, footer: String? = null, content: @Compo
 fun SettingsRow(
     title: String,
     value: String? = null,
+    modifier: Modifier = Modifier,
     icon: ImageVector? = null,
     titleColor: Color = Color.Unspecified,
     showChevron: Boolean = true,
@@ -105,7 +106,7 @@ fun SettingsRow(
     trailing: (@Composable () -> Unit)? = null,
 ) {
     Row(
-        Modifier.fillMaxWidth().heightIn(min = 52.dp)
+        modifier.fillMaxWidth().heightIn(min = 52.dp)
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,

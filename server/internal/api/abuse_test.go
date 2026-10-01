@@ -34,7 +34,7 @@ func TestConcurrentSendsRespectQueueQuota(t *testing.T) {
 		}(a)
 	}
 	wg.Wait()
-	n, _, err := e.st.QueueUsage(context.Background(), b.ID)
+	n, _, err := e.st.EnvelopeUsage(context.Background(), b.ID) // 配额只算信封，事件不占用
 	if err != nil {
 		t.Fatal(err)
 	}

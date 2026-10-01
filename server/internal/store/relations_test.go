@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"testing"
 )
@@ -79,5 +78,5 @@ func TestRelationsSetQuery(t *testing.T) {
 }
 
 func makeFriendsTx(s *Store, a, b string) error {
-	return s.withTx(context.Background(), func(tx *sql.Tx) error { return makeFriends(context.Background(), tx, a, b, NowMillis()) })
+	return s.withTx(context.Background(), func(tx dbtx) error { return makeFriends(context.Background(), tx, a, b, NowMillis()) })
 }

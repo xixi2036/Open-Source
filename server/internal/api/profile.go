@@ -1,7 +1,9 @@
 package api
 
 import (
+	"errors"
 	"net/http"
+	"time"
 
 	"hush/server/internal/store"
 	"hush/server/internal/ws"
@@ -38,12 +40,17 @@ func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request, uid
 		fail(w, codeBadRequest, "签名不能超过 256 个字符")
 		return
 	}
-	if !s.requireAvatar(w, r, req.AvatarID, "头像附件不存在") {
-		return
-	}
 	var p store.Profile
 	err := s.st.Update(r.Context(), func(t *store.Tx) error {
 		var err error
+		// 头像必须是自己上传的附件；检查与写入在同一事务里（B4）
+		if req.AvatarID != nil && *req.AvatarID != "" {
+			if owns, err := t.OwnsAttachment(*req.AvatarID, uid); err != nil {
+				return err
+			} else if !owns {
+				return errAvatar
+			}
+		}
 		if p, err = t.UpdateProfile(uid, store.ProfileUpdate{Name: req.Name, About: req.About, AvatarID: req.AvatarID}); err != nil {
 			return err
 		}
@@ -53,6 +60,10 @@ func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request, uid
 		}
 		return ws.Emit(t, contacts, "profile_updated", "profile_updated:"+uid, obj{"profile": p})
 	})
+	if errors.Is(err, errAvatar) {
+		fail(w, codeNotFound, "头像附件不存在")
+		return
+	}
 	if err != nil {
 		internalErr(w, r, err)
 		return
@@ -85,6 +96,11 @@ func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request, uid strin
 
 // GET /v1/users/search?email= → Profile 或 404
 func (s *Server) handleSearchUser(w http.ResponseWriter, r *http.Request, uid string) {
+	// 按用户限速：否则可以用这个接口批量探测哪些邮箱注册过
+	if !s.searchLimiter.allow(uid, time.Now()) {
+		fail(w, codeRateLimited, "搜索过于频繁，请稍后再试")
+		return
+	}
 	email, valid := normalizeEmail(r.URL.Query().Get("email"))
 	if !valid {
 		fail(w, codeBadRequest, "邮箱格式无效")

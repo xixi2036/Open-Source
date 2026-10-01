@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"net"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -32,13 +31,9 @@ func normalizeEmail(s string) (string, bool) {
 	return s, true
 }
 
-// remoteIP 返回对端 IP（不信任 X-Forwarded-For：服务端直接对外，没有反向代理）。
-func remoteIP(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
-}
+// clientIP 返回客户端 IP：默认是 TCP 对端地址；配置了可信代理（--trusted-proxy）且请求确实来自它们时，
+// 取它们写的 X-Forwarded-For（见 netx.Proxies.ClientIP）。
+func (s *Server) clientIP(r *http.Request) string { return s.cfg.TrustedProxies.ClientIP(r) }
 
 func randomCode() (string, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
@@ -58,7 +53,7 @@ func newToken() (string, error) {
 
 // POST /v1/auth/code {email} → {}
 func (s *Server) handleRequestCode(w http.ResponseWriter, r *http.Request) {
-	if !s.authCodeLimiter.allow(remoteIP(r), time.Now()) {
+	if !s.authCodeLimiter.allow(s.clientIP(r), time.Now()) {
 		fail(w, codeRateLimited, "请求过于频繁，请稍后再试")
 		return
 	}
@@ -82,7 +77,11 @@ func (s *Server) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 		internalErr(w, r, err)
 		return
 	}
-	if err := s.st.SaveCode(r.Context(), email, code); err != nil {
+	ip := s.clientIP(r)
+	fresh := code
+	// 已有的验证码还有效时重发同一个（见 store.SaveCode）
+	code, err = s.st.SaveCode(r.Context(), email, ip, code)
+	if err != nil {
 		if errors.Is(err, store.ErrRateLimited) {
 			fail(w, codeRateLimited, "发送过于频繁，请 60 秒后再试")
 			return
@@ -95,7 +94,9 @@ func (s *Server) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.cfg.Mailer.SendCode(email, code); err != nil {
-		s.st.ClearCode(r.Context(), email)
+		if code == fresh { // 重发的旧验证码可能已经在用户手里，不能删
+			s.st.ClearCode(r.Context(), email)
+		}
 		log.Printf("[auth] 验证码发送失败 %s: %s", hmail.MaskEmail(email), strings.ReplaceAll(err.Error(), email, hmail.MaskEmail(email)))
 		fail(w, codeInternal, "验证码邮件发送失败")
 		return
@@ -104,9 +105,39 @@ func (s *Server) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 	ok(w, obj{})
 }
 
-// POST /v1/auth/verify {email, code, device_name, platform} → {user_id, token, is_new}
+// policyError 是登录事务里因账号状态或注册策略被拒绝的结果（整个事务回滚）。
+type policyError struct{ code, msg string }
+
+func (e *policyError) Error() string { return e.code }
+
+// registrationDenied 判断新用户能否注册（邀请码本身是否可用在事务里另行校验）。
+func registrationDenied(set *Settings, email, invite string) *policyError {
+	if set.RegistrationMode == RegClosed {
+		return &policyError{codeRegistrationClosed, "当前不开放注册"}
+	}
+	if len(set.EmailDomains) > 0 {
+		domain := email[strings.LastIndexByte(email, '@')+1:]
+		allowed := false
+		for _, d := range set.EmailDomains {
+			allowed = allowed || d == domain
+		}
+		if !allowed {
+			return &policyError{codeEmailNotAllowed, "该邮箱域名不在允许注册的范围内"}
+		}
+	}
+	if set.RegistrationMode == RegInvite && invite == "" {
+		return &policyError{codeInviteRequired, "注册需要邀请码"}
+	}
+	return nil
+}
+
+// POST /v1/auth/verify {email, code, device_name, platform, invite_code?} → {user_id, token, is_new}
+//
+// 验证码先校验、在登录事务里才消费：账号被停用（403 account_disabled）或注册策略拒绝
+// （403 invite_required / invite_invalid / registration_closed / email_not_allowed）时验证码仍然有效，
+// 客户端补上邀请码即可用同一个验证码重试。注册策略只约束新用户，老用户登录不受影响。
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
-	if !s.authVerifyLimiter.allow(remoteIP(r), time.Now()) {
+	if !s.authVerifyLimiter.allow(s.clientIP(r), time.Now()) {
 		fail(w, codeRateLimited, "请求过于频繁，请稍后再试")
 		return
 	}
@@ -115,6 +146,7 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		Code       string `json:"code"`
 		DeviceName string `json:"device_name"`
 		Platform   string `json:"platform"`
+		InviteCode string `json:"invite_code"`
 	}
 	if !decode(w, r, &req, 0) {
 		return
@@ -129,13 +161,15 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		fail(w, codeBadRequest, "缺少验证码")
 		return
 	}
-	if len(req.DeviceName) > 128 || len(req.Platform) > 32 {
-		fail(w, codeBadRequest, "device_name/platform 过长")
+	if len(req.DeviceName) > 128 || len(req.Platform) > 32 || len(req.InviteCode) > 64 {
+		fail(w, codeBadRequest, "device_name/platform/invite_code 过长")
 		return
 	}
+	invite := store.NormalizeInvite(req.InviteCode)
+	ip := s.clientIP(r)
 	devOK := s.cfg.DevCode != "" && subtle.ConstantTimeCompare([]byte(code), []byte(s.cfg.DevCode)) == 1
 	if !devOK {
-		if err := s.st.CheckCode(r.Context(), email, code); err != nil {
+		if err := s.st.PeekCode(r.Context(), email, ip, code); err != nil {
 			if errors.Is(err, store.ErrBadCode) {
 				log.Printf("[auth] 验证码错误 %s", hmail.MaskEmail(email))
 				fail(w, codeUnauthorized, "验证码错误或已过期")
@@ -155,29 +189,79 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		internalErr(w, r, err)
 		return
 	}
-	// 登录与发给联系人的 key_changed 在同一事务内写入（outbox）。
+	set := s.set()
+	// 账号状态与注册策略检查、验证码消费、登录、发给联系人的 key_changed 都在同一事务内（outbox）。
+	// 停用检查必须在 Login 之前：Login 会清空已有用户的密钥与队列。
 	var res store.LoginResult
 	err = s.st.Update(r.Context(), func(t *store.Tx) error {
-		var err error
-		if res, err = t.Login(email, req.Platform, req.DeviceName, hashToken(token)); err != nil || res.IsNew {
+		exists, disabled, err := t.AccountState(email)
+		if err != nil {
 			return err
 		}
+		if disabled {
+			return &policyError{codeAccountDisabled, "该账号已被停用"}
+		}
+		useInvite := false
+		if !exists {
+			if denied := registrationDenied(set, email, invite); denied != nil {
+				return denied
+			}
+			if useInvite = set.RegistrationMode == RegInvite; useInvite {
+				if err := t.ConsumeInvite(invite); err != nil {
+					if errors.Is(err, store.ErrInviteInvalid) {
+						return &policyError{codeInviteInvalid, "邀请码无效、已过期或已用完"}
+					}
+					return err
+				}
+			}
+		}
+		if !devOK {
+			if err := t.ConsumeCode(email, ip, code); err != nil {
+				return err
+			}
+		}
+		if res, err = t.Login(email, req.Platform, req.DeviceName, hashToken(token)); err != nil {
+			return err
+		}
+		if res.IsNew {
+			if useInvite {
+				return t.RecordInviteUse(invite, res.User.ID, email)
+			}
+			return nil
+		}
+		// 单设备：旧连接收到 logged_out 后关闭（不入队列）。放在提交回调里：它紧跟着本事务的提交执行，
+		// 早于之后任何事务的投递——重新登录之后入队的信封不会再交给旧设备（B6）。
+		uid := res.User.ID
+		t.OnCommit(func() {
+			s.hub.Kick(uid, obj{"t": "event", "d": obj{"type": "logged_out", "reason": "logged_in_elsewhere"}},
+				ws.CloseLoggedOut, "logged_in_elsewhere")
+		})
 		contacts, err := t.Contacts(res.User.ID)
 		if err != nil {
 			return err
 		}
 		return ws.Emit(t, contacts, "key_changed", "key_changed:"+res.User.ID, obj{"user_id": res.User.ID})
 	})
-	if err != nil {
+	var denied *policyError
+	switch {
+	case errors.As(err, &denied):
+		if denied.code == codeInviteInvalid && !devOK {
+			// 一个验证码最多试 5 次邀请码，防止拿着有效验证码枚举邀请码
+			if err := s.st.BumpCodeAttempt(r.Context(), email, ip); err != nil {
+				log.Printf("[auth] 记录邀请码失败次数出错: %v", err)
+			}
+		}
+		log.Printf("[auth] 登录被拒绝 %s: %s", hmail.MaskEmail(email), denied.code)
+		fail(w, denied.code, denied.msg)
+		return
+	case errors.Is(err, store.ErrBadCode): // 验证码已被并发的另一次登录消费
+		fail(w, codeUnauthorized, "验证码错误或已过期")
+		return
+	case err != nil:
 		internalErr(w, r, err)
 		return
 	}
 	uid := res.User.ID
-	if !res.IsNew {
-		// 单设备：旧连接收到 logged_out 后关闭（不入队列）。
-		s.hub.Kick(uid, obj{"t": "event", "d": obj{"type": "logged_out", "reason": "logged_in_elsewhere"}},
-			ws.CloseLoggedOut, "logged_in_elsewhere")
-	}
 	log.Printf("[auth] 登录成功 user=%s email=%s new=%v platform=%s generation=%d",
 		uid, hmail.MaskEmail(email), res.IsNew, req.Platform, res.User.DeviceGeneration)
 	ok(w, obj{"user_id": uid, "token": token, "is_new": res.IsNew})

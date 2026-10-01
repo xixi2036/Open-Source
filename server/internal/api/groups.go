@@ -2,7 +2,7 @@ package api
 
 import (
 	"errors"
-	"log"
+	"hush/server/internal/logx"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -15,7 +15,49 @@ const maxGroupMembers = 500
 
 func isAdminRole(role string) bool { return role == store.RoleOwner || role == store.RoleAdmin }
 
-// checkFriends 校验 ids 均为 uid 的好友，返回去重后（排除 uid 本人）的列表。
+// 写事务里重新核对权限时用的哨兵错误（事务回滚，映射为对应的错误码）。
+var (
+	errNotAdmin    = errors.New("not admin")
+	errNotOwner    = errors.New("not owner")
+	errNotAllowed  = errors.New("not allowed")
+	errAvatar      = errors.New("avatar not found")
+	errOwnerTarget = errors.New("target is owner")
+)
+
+// roleInTx 在写事务里读取操作者此刻的角色：权限检查与写入在同一个事务里，刚被降级或移出群的人的并发请求不会成功（B3）。
+func roleInTx(t *store.Tx, gid, uid string) (string, error) {
+	role, err := t.MemberRole(gid, uid)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", store.ErrNotMember
+	}
+	return role, err
+}
+
+// groupTxErr 把群操作事务里的错误映射为响应；err 为 nil 时返回 true。
+func groupTxErr(w http.ResponseWriter, r *http.Request, err error, adminMsg string) bool {
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, store.ErrNotMember):
+		fail(w, codeForbidden, "你不是该群成员")
+	case errors.Is(err, errNotAdmin), errors.Is(err, errNotOwner), errors.Is(err, errNotAllowed):
+		fail(w, codeForbidden, adminMsg)
+	case errors.Is(err, errAvatar):
+		fail(w, codeNotFound, "群头像附件不存在")
+	case errors.Is(err, errOwnerTarget):
+		fail(w, codeBadRequest, "不能修改群主的角色")
+	case errors.Is(err, store.ErrTooManyMembers):
+		fail(w, codeBadRequest, "群成员过多")
+	case errors.Is(err, store.ErrNotFound):
+		fail(w, codeNotFound, "该用户不是群成员")
+	default:
+		internalErr(w, r, err)
+	}
+	return false
+}
+
+// checkFriends 校验 ids 均为 uid 的好友、且与 uid 之间没有拉黑关系（被拉黑的人不能把对方拉进群），
+// 返回去重后（排除 uid 本人）的列表。
 func (s *Server) checkFriends(w http.ResponseWriter, r *http.Request, uid string, ids []string) ([]string, bool) {
 	seen := map[string]bool{}
 	var out []string
@@ -31,9 +73,18 @@ func (s *Server) checkFriends(w http.ResponseWriter, r *http.Request, uid string
 		internalErr(w, r, err)
 		return nil, false
 	}
+	blocked, err := s.st.BlockedAmong(r.Context(), uid, out)
+	if err != nil {
+		internalErr(w, r, err)
+		return nil, false
+	}
 	for _, id := range out {
 		if !friends[id] {
 			fail(w, codeNotFriends, "只能添加你的好友入群: "+id)
+			return nil, false
+		}
+		if blocked[id] {
+			fail(w, codeBlocked, "你们之间存在拉黑关系，不能拉入群: "+id)
 			return nil, false
 		}
 	}
@@ -91,7 +142,7 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request, uid s
 		internalErr(w, r, err)
 		return
 	}
-	log.Printf("[group] %s 创建群 %s（%d 人）", uid, g.ID, len(g.Members))
+	logx.Debugf("[group] %s 创建群 %s（%d 人）", uid, g.ID, len(g.Members))
 	ok(w, g)
 }
 
@@ -153,12 +204,21 @@ func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request, uid s
 		fail(w, codeBadRequest, "群公告过长")
 		return
 	}
-	// 与个人头像一致：avatar_id 必须是已上传的附件（空串表示清除）
-	if !s.requireAvatar(w, r, req.AvatarID, "群头像附件不存在") {
-		return
-	}
 	var g store.Group
 	err := s.st.Update(r.Context(), func(t *store.Tx) error {
+		if role, err := roleInTx(t, gid, uid); err != nil {
+			return err
+		} else if !isAdminRole(role) {
+			return errNotAdmin
+		}
+		// 与个人头像一致：avatar_id 必须是操作者自己上传的附件（空串表示清除）；检查与写入在同一事务里
+		if req.AvatarID != nil && *req.AvatarID != "" {
+			if owns, err := t.OwnsAttachment(*req.AvatarID, uid); err != nil {
+				return err
+			} else if !owns {
+				return errAvatar
+			}
+		}
 		if err := t.UpdateGroup(gid, store.GroupUpdate{Name: req.Name, AvatarID: req.AvatarID, Announcement: req.Announcement}); err != nil {
 			return err
 		}
@@ -166,8 +226,7 @@ func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request, uid s
 		g, err = broadcastGroup(t, gid)
 		return err
 	})
-	if err != nil {
-		internalErr(w, r, err)
+	if !groupTxErr(w, r, err, "仅管理员可修改群资料") {
 		return
 	}
 	ok(w, g)
@@ -203,6 +262,11 @@ func (s *Server) handleAddMembers(w http.ResponseWriter, r *http.Request, uid st
 	}
 	var g store.Group
 	err := s.st.Update(r.Context(), func(t *store.Tx) error {
+		if role, err := roleInTx(t, gid, uid); err != nil {
+			return err
+		} else if !isAdminRole(role) {
+			return errNotAdmin
+		}
 		if err := t.AddMembers(gid, ids, maxGroupMembers); err != nil {
 			return err
 		}
@@ -210,14 +274,10 @@ func (s *Server) handleAddMembers(w http.ResponseWriter, r *http.Request, uid st
 		g, err = broadcastGroup(t, gid)
 		return err
 	})
-	if errors.Is(err, store.ErrTooManyMembers) {
-		fail(w, codeBadRequest, "群成员过多")
-		return
-	} else if err != nil {
-		internalErr(w, r, err)
+	if !groupTxErr(w, r, err, "仅管理员可添加成员") {
 		return
 	}
-	log.Printf("[group] %s 向群 %s 添加 %d 人", uid, gid, len(ids))
+	logx.Debugf("[group] %s 向群 %s 添加 %d 人", uid, gid, len(ids))
 	ok(w, g)
 }
 
@@ -246,11 +306,23 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, uid 
 	}
 	var dissolved bool
 	err := s.st.Update(r.Context(), func(t *store.Tx) error {
-		var err error
+		role, err := roleInTx(t, gid, uid)
+		if err != nil {
+			return err
+		}
+		if target != uid {
+			targetRole, err := t.MemberRole(gid, target)
+			if err != nil {
+				return err
+			}
+			if !(role == store.RoleOwner || (role == store.RoleAdmin && targetRole == store.RoleMember)) {
+				return errNotAllowed
+			}
+		}
 		if dissolved, err = t.RemoveMember(gid, target); err != nil {
 			return err
 		}
-		if err := ws.Emit(t, []string{target}, "group_removed", "", obj{"group_id": gid}); err != nil {
+		if err := ws.Emit(t, []string{target}, "group_removed", "group_removed:"+gid, obj{"group_id": gid}); err != nil {
 			return err
 		}
 		if dissolved {
@@ -259,11 +331,10 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, uid 
 		_, err = broadcastGroup(t, gid)
 		return err
 	})
-	if err != nil {
-		storeErr(w, r, err, "该用户不是群成员")
+	if !groupTxErr(w, r, err, "无权移除该成员") {
 		return
 	}
-	log.Printf("[group] 群 %s 移除 %s（操作者 %s，解散=%v）", gid, target, uid, dissolved)
+	logx.Debugf("[group] 群 %s 移除 %s（操作者 %s，解散=%v）", gid, target, uid, dissolved)
 	ok(w, obj{})
 }
 
@@ -306,6 +377,16 @@ func (s *Server) handleSetAdmin(w http.ResponseWriter, r *http.Request, uid stri
 	}
 	var g store.Group
 	err = s.st.Update(r.Context(), func(t *store.Tx) error {
+		if role, err := roleInTx(t, gid, uid); err != nil {
+			return err
+		} else if role != store.RoleOwner {
+			return errNotOwner
+		}
+		if tr, err := t.MemberRole(gid, target); err != nil {
+			return err
+		} else if tr == store.RoleOwner {
+			return errOwnerTarget
+		}
 		if err := t.SetRole(gid, target, newRole); err != nil {
 			return err
 		}
@@ -313,8 +394,7 @@ func (s *Server) handleSetAdmin(w http.ResponseWriter, r *http.Request, uid stri
 		g, err = broadcastGroup(t, gid)
 		return err
 	})
-	if err != nil {
-		internalErr(w, r, err)
+	if !groupTxErr(w, r, err, "仅群主可设置管理员") {
 		return
 	}
 	ok(w, g)

@@ -11,9 +11,12 @@ use crate::error::{HushError, Result};
 use crate::types::*;
 use crate::util::safe_file_name;
 
+/// 明文媒体（头像、朋友圈图片）下载进内存的大小上限（B2）
+const MAX_MEDIA_BYTES: u64 = 25 * 1024 * 1024;
+
 impl Inner {
     pub(crate) async fn request_code(&self, server_url: &str, email: &str) -> Result<()> {
-        let base = api::normalize_base(server_url)?;
+        let base = api::normalize_base(server_url, self.allow_insecure_http())?;
         let email = email.trim();
         if !email.contains('@') {
             return Err(HushError::invalid("邮箱格式不正确"));
@@ -24,7 +27,7 @@ impl Inner {
     }
 
     pub(crate) async fn verify_code(self: &Arc<Self>, server_url: &str, email: &str, code: &str) -> Result<MyAccount> {
-        let base = api::normalize_base(server_url)?;
+        let base = api::normalize_base(server_url, self.allow_insecure_http())?;
         let email = email.trim().to_string();
         let a = Api::new(self.http.clone(), base.clone(), None);
         let platform = if self.platform.is_empty() { "android".to_string() } else { self.platform.clone() };
@@ -55,8 +58,19 @@ impl Inner {
             self.set_auth(None)?;
             return Err(e);
         }
-        let me: Profile = api.get("/v1/me").await?;
-        self.store.put_profile_authoritative(&me)?;
+        // B5：到这里登录已经完成（token 已保存、密钥已上传）。取资料失败不能再返回 Err——那样调用方以为没登录上，
+        // 而本地已是登录态。用缓存里的资料（同一用户重新登录）或只有 id 的空资料顶上，之后照常刷新。
+        let me: Profile = match api.get::<Profile>("/v1/me").await {
+            Ok(me) => {
+                self.store.put_profile_authoritative(&me)?;
+                me
+            }
+            Err(e) => {
+                tracing::warn!("登录后获取个人资料失败，先用本地缓存: {e}");
+                let cached = self.store.get_profile(&r.user_id).ok().flatten();
+                cached.unwrap_or(Profile { id: r.user_id.clone(), email: Some(email.clone()), ..Default::default() })
+            }
+        };
         let email = me.email.clone().filter(|e| !e.is_empty()).unwrap_or(email);
         let current = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(mut a) = current {
@@ -81,14 +95,21 @@ impl Inner {
     pub(crate) async fn logout(&self) -> Result<()> {
         // 不经 `api()`：token 若已过期，这里的 401 不应再触发一次 LoggedOut(session_expired)
         if let Ok(a) = self.auth() {
-            let api = Api::new(self.http.clone(), a.server_url, Some(a.token));
-            if let Err(e) = api.post_empty::<Empty>("/v1/auth/logout").await {
-                tracing::warn!("服务端登出失败（忽略）: {e}");
+            // B1：公网明文地址（旧版本保存的登录态）不再带着 token 发请求，直接清本地
+            if api::ensure_secure(&a.server_url, self.allow_insecure_http()).is_ok() {
+                let api = Api::new(self.http.clone(), a.server_url, Some(a.token));
+                if let Err(e) = api.post_empty::<Empty>("/v1/auth/logout").await {
+                    tracing::warn!("服务端登出失败（忽略）: {e}");
+                }
             }
         }
         self.stop();
         self.set_auth(None)?;
         self.store.wipe_all()?;
+        // B8：WAL 截断并 VACUUM，已删除的数据不留在库文件里（失败只记日志，不影响登出）
+        if let Err(e) = self.store.compact_after_wipe() {
+            tracing::warn!("登出后压缩本地库失败: {e}");
+        }
         let _ = std::fs::remove_dir_all(&self.files_dir);
         std::fs::create_dir_all(self.files_dir.join("media"))?;
         Ok(())
@@ -97,21 +118,28 @@ impl Inner {
     /// 服务端通知被挤下线 / token 失效。
     pub(crate) fn on_logged_out(&self, reason: &str) {
         let _ = self.set_auth(None);
-        self.finish_logged_out(reason);
+        self.finish_logged_out(reason, true);
     }
 
     /// 带 `token` 的请求收到 401（或 WS 握手 401）：token 已失效（例如 90 天未使用）。
-    /// 与 4001 相同处理，原因为 `session_expired`；token 已不是当前登录态时忽略（旧请求晚到）。
+    /// 原因为 `session_expired`；token 已不是当前登录态时忽略（旧请求晚到）。
+    ///
+    /// B1：**只清 token，不清加密状态**。401 只是一个没有完整性保护之外任何凭据的 HTTP 状态码——
+    /// 明文链路上的中间人、出了问题的网关都能造出来；以前一个 401 就把账户密钥与全部会话销毁了。
+    /// 加密状态留到下次 `verify_code`：同一用户重新登录时按原有逻辑重建（服务端此时会换新的设备代）。
     pub(crate) fn on_session_expired(&self, token: &str) {
         if self.clear_auth_if(token) {
-            tracing::warn!("登录已过期（401），清除本地登录态");
-            self.finish_logged_out("session_expired");
+            tracing::warn!("登录已过期（401），清除本地登录态（加密状态保留到重新登录）");
+            self.finish_logged_out("session_expired", false);
         }
     }
 
-    /// 登录态已清除之后：清加密状态（保留消息）、停止后台任务、发出 LoggedOut。
-    fn finish_logged_out(&self, reason: &str) {
-        let _ = self.store.wipe_crypto();
+    /// 登录态已清除之后：停止后台任务、发出 LoggedOut。`wipe_crypto`：同时清加密状态（保留消息）——
+    /// 只用于服务端经已认证的连接明确通知的登出（4001 在别处登录、`logged_out` 帧）。
+    fn finish_logged_out(&self, reason: &str, wipe_crypto: bool) {
+        if wipe_crypto {
+            let _ = self.store.wipe_crypto();
+        }
         self.signal_stop();
         self.set_connection_state(ConnectionState::Disconnected);
         self.emit(CoreEvent::LoggedOut { reason: reason.to_string() });
@@ -186,7 +214,7 @@ impl Inner {
         if Path::new(&path).exists() {
             return Ok(path.to_string_lossy().to_string());
         }
-        let data = self.api()?.download(id).await?;
+        let data = self.api()?.download(id, MAX_MEDIA_BYTES).await?;
         let tmp = path.with_extension("part");
         tokio::fs::write(&tmp, &data).await?;
         tokio::fs::rename(&tmp, &path).await?;
@@ -294,7 +322,8 @@ mod tests {
         v
     }
 
-    /// C-G：任一接口 401 → 清除本地登录态、清加密状态（保留消息），发出 LoggedOut(session_expired)，只发一次。
+    /// C-G / B1：任一接口 401 → 清除本地登录态，发出 LoggedOut(session_expired)，只发一次；
+    /// 加密状态（账户密钥、会话）与消息都保留，留到重新登录时处理。
     #[tokio::test]
     async fn rest_401_expires_session() {
         let srv = stub::start(Arc::new(|_m, _p, _b| (401, r#"{"error":"unauthorized","message":"登录已过期"}"#.into()))).await;
@@ -307,7 +336,7 @@ mod tests {
         assert!(err.is_server_code("unauthorized"), "{err:?}");
         assert!(!inner.is_logged_in());
         assert!(inner.store.kv_get("auth").unwrap().is_none(), "持久化的登录态也清除");
-        assert!(inner.store.load_account().unwrap().is_none(), "与 4001 相同：清加密状态");
+        assert!(inner.store.load_account().unwrap().is_some(), "B1：一个 401 不能销毁加密状态");
         assert_eq!(inner.store.messages("u:bob", None, 10).unwrap().len(), 1, "消息保留");
         // 并发 / 之后的请求不会重复登出
         assert!(inner.get_user("bob").await.is_err());
@@ -340,5 +369,80 @@ mod tests {
         let p: Profile = serde_json::from_str(r#"{"id":"u","name":"n","email":""}"#).unwrap();
         assert_eq!(p.email, None, "空串视为没有");
         assert!(!serde_json::to_string(&p).unwrap().contains("email"), "没有邮箱时不序列化");
+    }
+
+    /// B1：公网地址必须 https。登录入口直接拒绝明文公网地址（不发请求）；旧版本保存的公网 http 登录态不再带 token 发请求；
+    /// 本机与内网地址照常可用；调试开关可以放开。
+    #[tokio::test]
+    async fn public_http_rejected_unless_allowed() {
+        let (inner, _dir) = crate::client::test_inner();
+        for url in ["http://hush.example.com", "http://8.8.8.8:8080"] {
+            assert!(matches!(inner.request_code(url, "a@b.c").await, Err(HushError::InvalidInput { .. })), "{url}");
+            assert!(matches!(inner.verify_code(url, "a@b.c", "000000").await, Err(HushError::InvalidInput { .. })));
+        }
+        assert!(inner.is_logged_in(), "被拒绝的登录尝试不影响现有登录态");
+        // 内网地址：照常去连（这里没有服务端，得到的是网络错误而不是参数错误）
+        assert!(matches!(inner.request_code("http://127.0.0.1:1", "a@b.c").await, Err(HushError::Network { .. })));
+        assert!(inner.api().is_ok());
+        // 旧版本保存的公网 http 登录态
+        let mut a = inner.auth().unwrap();
+        a.server_url = "http://hush.example.com".into();
+        inner.set_auth(Some(a)).unwrap();
+        assert!(matches!(inner.api(), Err(HushError::InvalidInput { .. })));
+        assert!(matches!(inner.get_user("bob").await, Err(HushError::InvalidInput { .. })));
+        assert!(inner.is_logged_in(), "不因此登出");
+        inner.set_allow_insecure_http(true);
+        assert!(inner.api().is_ok());
+    }
+
+    /// B5：密钥上传成功后 `/v1/me` 失败，`verify_code` 仍返回成功（登录已完成），不再出现「返回 Err 但已是登录态」。
+    #[tokio::test]
+    async fn verify_code_succeeds_when_profile_fetch_fails() {
+        let srv = stub::start(Arc::new(|m, p, _b| match (m, p) {
+            ("POST", "/v1/auth/verify") => (200, r#"{"user_id":"u-1","token":"tok-1","is_new":true}"#.into()),
+            ("PUT", "/v1/keys") => (200, r#"{"one_time_key_count":100}"#.into()),
+            ("GET", "/v1/me") => (503, "Service Unavailable".into()),
+            _ => (404, r#"{"error":"not_found","message":"stub"}"#.into()),
+        }))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Inner::new_arc(dir.path().to_string_lossy().to_string(), vec![7u8; 32], "test".into(), "t".into()).unwrap();
+        let acct = inner.verify_code(&srv.url, "me@x.y", "123456").await.expect("登录已完成，应返回成功");
+        assert_eq!((acct.user_id.as_str(), acct.email.as_str(), acct.is_new), ("u-1", "me@x.y", true));
+        assert_eq!(acct.profile.id, "u-1");
+        assert!(inner.is_logged_in());
+        assert!(inner.store.load_account().unwrap().is_some());
+        assert_eq!(inner.my_account().unwrap().user_id, "u-1");
+        // 密钥上传失败仍然是登录失败，且不留登录态
+        let srv2 = stub::start(Arc::new(|m, p, _b| match (m, p) {
+            ("POST", "/v1/auth/verify") => (200, r#"{"user_id":"u-2","token":"tok-2"}"#.into()),
+            _ => (503, "x".into()),
+        }))
+        .await;
+        let dir2 = tempfile::tempdir().unwrap();
+        let inner2 = Inner::new_arc(dir2.path().to_string_lossy().to_string(), vec![7u8; 32], "test".into(), "t".into()).unwrap();
+        assert!(inner2.verify_code(&srv2.url, "me@x.y", "123456").await.is_err());
+        assert!(!inner2.is_logged_in());
+    }
+
+    /// B8：`secure_delete` 打开；登出后 WAL 被截断、库文件收缩。
+    #[tokio::test]
+    async fn logout_compacts_database() {
+        let (inner, dir) = crate::client::test_inner();
+        let secure: i64 = inner.store.debug_query_i64("PRAGMA secure_delete");
+        assert_eq!(secure, 1);
+        for i in 0..400 {
+            inner.insert_system("u:bob", &format!("占空间的消息 {i} {}", "x".repeat(2000))).unwrap();
+        }
+        let db = dir.path().join("hush.sqlite");
+        let wal = dir.path().join("hush.sqlite-wal");
+        inner.store.debug_exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        let before = std::fs::metadata(&db).unwrap().len();
+        assert!(before > 800_000, "{before}");
+        inner.logout().await.unwrap();
+        let after = std::fs::metadata(&db).unwrap().len();
+        assert!(after < before / 4, "登出后库文件应收缩: {before} -> {after}");
+        assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0, "WAL 应被截断");
+        assert!(inner.store.messages("u:bob", None, 10).unwrap().is_empty());
     }
 }

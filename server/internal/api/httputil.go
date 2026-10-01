@@ -8,13 +8,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
+	"hush/server/internal/logx"
+	"hush/server/internal/metrics"
 	"hush/server/internal/store"
 )
 
@@ -35,6 +39,14 @@ const (
 	codeTooLarge     = "too_large"
 	codeInternal     = "internal"
 	codeMethod       = "method_not_allowed"
+	codeUnavailable  = "unavailable" // 503：过载或正在停机，稍后重试
+
+	// 管理后台相关（2026-09-30）：账号被停用、注册受限
+	codeAccountDisabled    = "account_disabled"
+	codeInviteRequired     = "invite_required"
+	codeInviteInvalid      = "invite_invalid"
+	codeRegistrationClosed = "registration_closed"
+	codeEmailNotAllowed    = "email_not_allowed"
 )
 
 var statusByCode = map[string]int{
@@ -49,6 +61,13 @@ var statusByCode = map[string]int{
 	codeTooLarge:     http.StatusRequestEntityTooLarge,
 	codeInternal:     http.StatusInternalServerError,
 	codeMethod:       http.StatusMethodNotAllowed,
+	codeUnavailable:  http.StatusServiceUnavailable,
+
+	codeAccountDisabled:    http.StatusForbidden,
+	codeInviteRequired:     http.StatusForbidden,
+	codeInviteInvalid:      http.StatusForbidden,
+	codeRegistrationClosed: http.StatusForbidden,
+	codeEmailNotAllowed:    http.StatusForbidden,
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -72,7 +91,16 @@ func fail(w http.ResponseWriter, code, msg string) {
 
 // internalErr 记录内部错误并返回 500。
 func internalErr(w http.ResponseWriter, r *http.Request, err error) {
-	log.Printf("[error] %s %s: %v", r.Method, r.URL.Path, err)
+	if errors.Is(err, store.ErrClosed) {
+		fail(w, codeUnavailable, "服务器正在停机")
+		return
+	}
+	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		// 客户端已断开：不是服务端故障，不记 5xx
+		w.WriteHeader(499)
+		return
+	}
+	log.Printf("[error] %s %s: %v", r.Method, logPath(r.URL.Path), err)
 	fail(w, codeInternal, "服务器内部错误")
 }
 
@@ -191,7 +219,7 @@ func (s *Server) auth(fn authed) http.Handler {
 			return
 		}
 		th := hashToken(tok)
-		uid, err := s.st.Authenticate(r.Context(), th, store.NowMillis(), s.cfg.TokenTTL)
+		uid, err := s.st.Authenticate(r.Context(), th, store.NowMillis(), s.set().TokenTTL)
 		if errors.Is(err, store.ErrNotFound) {
 			fail(w, codeUnauthorized, "token 无效或已失效")
 			return
@@ -200,6 +228,7 @@ func (s *Server) auth(fn authed) http.Handler {
 			internalErr(w, r, err)
 			return
 		}
+		s.stats.touch(uid, time.Now())
 		fn(w, r.WithContext(context.WithValue(r.Context(), tokenHashKey, th)), uid)
 	})
 }
@@ -248,12 +277,37 @@ func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // logRequests 记录「方法 路径 状态 响应字节 耗时」。查询串不记录（可能含 token），附件 id 截断（见 maskID）。
-func logRequests(next http.Handler) http.Handler {
+// 同时把请求计入指标（按路由模式，不按原始路径），并兜住 handler 里的 panic：记一条 panic 记录、返回 500。
+func logRequests(next http.Handler, m *metrics.Registry) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w}
+		defer func() {
+			if v := recover(); v != nil {
+				if v == http.ErrAbortHandler {
+					panic(v)
+				}
+				log.Printf("[panic] %s %s: %v\n%s", r.Method, logPath(r.URL.Path), v, debug.Stack())
+				m.Incident(metrics.Incident{Kind: "panic", Method: r.Method, Path: logPath(r.URL.Path), Status: http.StatusInternalServerError,
+					Detail: fmt.Sprintf("%v\n%s", v, debug.Stack())})
+				if rec.status == 0 {
+					fail(rec, codeInternal, "服务器内部错误")
+				}
+			}
+			d := time.Since(start)
+			route := r.Pattern // ServeMux 匹配后写回请求；未匹配（404/405）为空
+			if route == "" {
+				route = "unmatched"
+			}
+			m.Observe(route, rec.status, d, route != "GET /v1/ws")
+			if rec.status >= 500 && rec.status != http.StatusSwitchingProtocols {
+				m.Incident(metrics.Incident{Kind: "5xx", Method: r.Method, Path: logPath(r.URL.Path), Status: rec.status, Detail: route})
+			}
+			if logx.Enabled(logx.Debug) {
+				log.Printf("[http] %s %s %d %dB %s", r.Method, logPath(r.URL.Path), rec.status, rec.bytes, d.Round(time.Microsecond))
+			}
+		}()
 		next.ServeHTTP(rec, r)
-		log.Printf("[http] %s %s %d %dB %s", r.Method, logPath(r.URL.Path), rec.status, rec.bytes, time.Since(start).Round(time.Microsecond))
 	})
 }
 

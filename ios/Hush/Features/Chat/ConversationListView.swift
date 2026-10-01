@@ -30,6 +30,7 @@ struct ConversationListView: View {
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button { searching = true } label: { Image(systemName: "magnifyingglass") }
+                    .accessibilityLabel("搜索")
                     .accessibilityIdentifier("searchButton")
                 Menu {
                     Button { showNewDirect = true } label: { Label("发起单聊", systemImage: "person") }
@@ -39,6 +40,7 @@ struct ConversationListView: View {
                 } label: {
                     Image(systemName: "square.and.pencil")
                 }
+                .accessibilityLabel("新建聊天")
                 .accessibilityIdentifier("newChatMenu")
             }
         }
@@ -133,7 +135,7 @@ struct ConversationRow: View {
             ConversationAvatar(convId: summary.id, size: 56)
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(title).font(.system(size: 17, weight: .medium)).foregroundStyle(Theme.textPrimary).lineLimit(1)
+                    Text(title).font(Fonts.sized(17, weight: .medium)).foregroundStyle(Theme.textPrimary).lineLimit(1)
                     Spacer()
                     Text(Fmt.listTime(summary.lastMessage?.sentAt ?? summary.lastActivityTs))
                         .font(Fonts.timestamp).foregroundStyle(Theme.textSecondary)
@@ -149,6 +151,8 @@ struct ConversationRow: View {
                     }
                     if summary.unreadCount > 0 {
                         BadgeView(count: Int(summary.unreadCount), muted: summary.muted)
+                            .accessibilityElement()
+                            .accessibilityLabel("未读 \(summary.unreadCount) 条")
                             .accessibilityIdentifier("unreadBadge")
                     }
                 }

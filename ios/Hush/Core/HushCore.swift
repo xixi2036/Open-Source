@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import OSLog
 import UIKit
 import UserNotifications
 
@@ -21,6 +22,27 @@ final class CoreEventBridge: EventListener, @unchecked Sendable {
     }
 }
 
+/// 核心库日志转到系统日志（subsystem com.hush.app，category hushcore）。
+/// 核心保证日志里不含消息明文、密钥与 token；Debug 转发全部级别，Release 只转发 warn 与 error。
+final class CoreLogBridge: LogListener, @unchecked Sendable {
+    private let logger = Logger(subsystem: "com.hush.app", category: "hushcore")
+
+    func onLog(level: LogLevel, module: String, message: String) {
+        switch level {
+        case .error: logger.error("[\(module, privacy: .public)] \(message, privacy: .public)")
+        case .warn: logger.warning("[\(module, privacy: .public)] \(message, privacy: .public)")
+        case .info:
+            #if DEBUG
+            logger.info("[\(module, privacy: .public)] \(message, privacy: .public)")
+            #endif
+        case .debug:
+            #if DEBUG
+            logger.debug("[\(module, privacy: .public)] \(message, privacy: .public)")
+            #endif
+        }
+    }
+}
+
 /// 全局可观察模型：持有 HushClient，负责启动、登录、连接、设置与事件分发。
 /// 会话 / 通讯录 / 朋友圈的数据与操作分别在 ConversationStore、ContactsStore、MomentsStore 中，
 /// 视图不直接访问 HushClient。
@@ -33,7 +55,7 @@ final class HushCore {
 
     var phase: AppPhase = .launching
     var account: MyAccount?
-    var serverURL: String = UserDefaults.standard.string(forKey: "serverURL") ?? "http://127.0.0.1:8080"
+    var serverURL: String = UserDefaults.standard.string(forKey: "serverURL") ?? ServerAddress.defaultURL
     var connection: ConnectionState = .disconnected
     var settings = Settings(readReceipts: true, typingIndicators: true, defaultDisappearingSecs: 0, notifications: true)
 
@@ -50,6 +72,7 @@ final class HushCore {
     var appActive = true
 
     @ObservationIgnored private var observers: [UUID: (CoreEvent) -> Void] = [:]
+    @ObservationIgnored private var bootstrapping = false
 
     private init() {}
 
@@ -65,46 +88,81 @@ final class HushCore {
 
     // MARK: - 启动与登录
 
+    /// 启动结果（在后台线程得到，回主线程应用）
+    private struct BootResult: @unchecked Sendable {
+        var client: HushClient
+        var account: MyAccount?
+        var settings: Settings?
+    }
+
+    /// B1：打开数据库（可能包含迁移）放到后台线程，启动页显示「正在准备数据…」。
+    /// 大库升级时主线程不被占用，不会白屏或被看门狗杀掉。
     func bootstrap() {
-        guard client == nil else { return }
-        do {
-            let key = try KeyStore.loadOrCreateDBKey()
-            let c = try HushClient(dataDir: AppPaths.dataDir.path, dbKey: key,
-                                   platform: "ios", deviceName: UIDevice.current.name)
-            c.setListener(listener: bridge)
-            attach(c)
-        } catch HushError.KeyMismatch {
-            phase = .failed("本机的聊天数据无法用当前密钥打开（例如从备份恢复到了新设备）", keyMismatch: true)
-            return
-        } catch {
-            phase = .failed(describe(error))
-            return
+        guard client == nil, !bootstrapping else { return }
+        bootstrapping = true
+        phase = .launching
+        let bridge = bridge
+        let deviceName = UIDevice.current.name
+        Task.detached(priority: .userInitiated) {
+            let result: Result<BootResult, Error>
+            do {
+                #if DEBUG
+                // 仅调试：人为拉长启动，供 UI 测试截取启动页
+                if let d = ProcessInfo.processInfo.environment["HUSH_DEBUG_BOOT_DELAY"].flatMap(Double.init) {
+                    try? await Task.sleep(for: .seconds(min(d, 10)))
+                }
+                #endif
+                setLogListener(listener: CoreLogBridge())
+                // A2：先设置备份排除与文件保护，再打开数据库
+                AppPaths.protectDataDir()
+                let key = try KeyStore.loadOrCreateDBKey()
+                let c = try HushClient(dataDir: AppPaths.dataDir.path, dbKey: key,
+                                       platform: "ios", deviceName: deviceName)
+                c.setListener(listener: bridge)
+                let acc = c.isLoggedIn() ? c.myAccount() : nil
+                result = .success(BootResult(client: c, account: acc, settings: acc == nil ? nil : c.settings()))
+            } catch {
+                result = .failure(error)
+            }
+            await MainActor.run { HushCore.shared.finishBootstrap(result) }
         }
-        if client.isLoggedIn(), let acc = client.myAccount() {
-            account = acc
-            serverURL = acc.serverUrl
-            loadLocal()
-            phase = acc.profile.name.isEmpty ? .needsProfile : .ready
-            startConnection()
-            Task { await fullSync() }
-        } else {
-            phase = .loggedOut
+    }
+
+    private func finishBootstrap(_ result: Result<BootResult, Error>) {
+        bootstrapping = false
+        switch result {
+        case let .failure(error):
+            if case HushError.KeyMismatch = error {
+                phase = .failed("本机的聊天数据无法用当前密钥打开（例如从备份恢复到了新设备）", keyMismatch: true)
+            } else {
+                phase = .failed(describe(error))
+            }
+        case let .success(boot):
+            attach(boot.client)
+            if let acc = boot.account {
+                account = acc
+                serverURL = acc.serverUrl
+                loadLocal(settings: boot.settings)
+                phase = acc.profile.name.isEmpty ? .needsProfile : .ready
+                startConnection()
+                Task { await fullSync() }
+            } else {
+                phase = .loggedOut
+            }
         }
     }
 
     /// 启动失败后用户确认「重置本地数据」：删除本地库与密钥，回到登录页（服务器上的好友关系不受影响）
     func resetLocalDataAndRestart() {
-        guard client == nil else { return }
+        guard client == nil, !bootstrapping else { return }
         try? FileManager.default.removeItem(at: AppPaths.dataDir)
         KeyStore.deleteDBKey()
-        phase = .launching
         bootstrap()
     }
 
     /// 启动失败后重试（例如设备解锁后钥匙串可读）
     func retryBootstrap() {
-        guard client == nil else { return }
-        phase = .launching
+        guard client == nil, !bootstrapping else { return }
         bootstrap()
     }
 
@@ -154,6 +212,7 @@ final class HushCore {
         media.reset()
         activeConvId = nil
         VoicePlayer.shared.stop()
+        VideoThumbnails.removeAll()
         UNBadge.set(0)
         let center = UNUserNotificationCenter.current()
         center.removeAllDeliveredNotifications()
@@ -170,6 +229,11 @@ final class HushCore {
     }
 
     /// 回到前台：确保长连接在跑，并用 HTTP 补拉一次积压消息
+    /// 进入后台（不含 .inactive）
+    func onBackground() {
+        appActive = false
+    }
+
     func onForeground() {
         appActive = true
         guard phase == .ready || phase == .needsProfile else { return }
@@ -189,9 +253,9 @@ final class HushCore {
         chats.reload()
     }
 
-    private func loadLocal() {
+    private func loadLocal(settings loaded: Settings? = nil) {
         moments.loadLocal(userId: myId)
-        settings = client.settings()
+        settings = loaded ?? client.settings()
         contacts.loadLocal(me: account?.profile)
         chats.reload()
     }
@@ -219,6 +283,8 @@ final class HushCore {
         switch event {
         case let .connectionChanged(state):
             connection = state
+            // 连接恢复：本次运行中发送失败的消息按原顺序自动重发一次
+            if state == .connected { chats.resendFailedAfterReconnect() }
             // 连接被同账号新连接替换后核心会保持登录但停止重连：前台时稍后再 start() 一次（幂等）
             if state == .disconnected && appActive {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in

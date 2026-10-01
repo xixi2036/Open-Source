@@ -40,14 +40,15 @@ pub fn tls_config() -> Arc<rustls::ClientConfig> {
     Arc::new(cfg)
 }
 
-/// 由 http(s) 基址构造 ws(s)://…/v1/ws?token=…
-pub fn ws_url(base: &str, token: &str) -> Result<url::Url, ConnectError> {
+/// 由 http(s) 基址构造 ws(s)://…/v1/ws。token **只放在 `Authorization` 头里**（B1）：
+/// 放进 URL 会被代理、网关与服务端访问日志记下来。
+pub fn ws_url(base: &str) -> Result<url::Url, ConnectError> {
     let mut u = url::Url::parse(base).map_err(|e| ConnectError::Other(e.to_string()))?;
     let scheme = if u.scheme() == "https" { "wss" } else { "ws" };
     u.set_scheme(scheme).map_err(|_| ConnectError::Other("无法设置 ws 协议".into()))?;
     let path = format!("{}/v1/ws", u.path().trim_end_matches('/'));
     u.set_path(&path);
-    u.query_pairs_mut().clear().append_pair("token", token);
+    u.set_query(None);
     Ok(u)
 }
 
@@ -65,7 +66,7 @@ pub async fn connect_with_limit(base: &str, token: &str, max_frame: usize) -> Re
 
 /// 建立连接；TCP、TLS、WS 握手每一步都有超时，任何一步卡住（强制门户、代理停滞、NAT 回收）都不会让重连循环永远挂起。
 async fn connect_with_timeout(base: &str, token: &str, max_frame: usize, step: Duration) -> Result<WsStream, ConnectError> {
-    let url = ws_url(base, token)?;
+    let url = ws_url(base)?;
     let host = url.host_str().ok_or_else(|| ConnectError::Other("缺少主机名".into()))?.to_string();
     let tls = url.scheme() == "wss";
     let port = url.port_or_known_default().unwrap_or(if tls { 443 } else { 80 });
@@ -89,9 +90,8 @@ async fn connect_with_timeout(base: &str, token: &str, max_frame: usize, step: D
     };
 
     let mut req = url.as_str().into_client_request().map_err(|e| ConnectError::Other(e.to_string()))?;
-    if let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}")) {
-        req.headers_mut().insert("Authorization", v);
-    }
+    let bearer = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| ConnectError::Other("token 含非法字符".into()))?;
+    req.headers_mut().insert("Authorization", bearer);
     match tokio::time::timeout(step, tokio_tungstenite::client_async_with_config(req, stream, Some(ws_config(max_frame)))).await {
         Err(_) => Err(ConnectError::Other("握手超时".into())),
         Ok(Ok((ws, _resp))) => Ok(ws),
@@ -108,8 +108,35 @@ mod tests {
 
     #[test]
     fn url_build() {
-        assert_eq!(ws_url("http://127.0.0.1:8080", "t").unwrap().as_str(), "ws://127.0.0.1:8080/v1/ws?token=t");
-        assert_eq!(ws_url("https://h.example/api", "a b").unwrap().as_str(), "wss://h.example/api/v1/ws?token=a+b");
+        assert_eq!(ws_url("http://127.0.0.1:8080").unwrap().as_str(), "ws://127.0.0.1:8080/v1/ws");
+        assert_eq!(ws_url("https://h.example/api").unwrap().as_str(), "wss://h.example/api/v1/ws");
+    }
+
+    /// B1：握手请求里 token 只出现在 Authorization 头，不进 URL。
+    #[tokio::test]
+    async fn handshake_carries_token_only_in_header() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&head).to_string()
+        });
+        let _ = connect_with_timeout(&format!("http://127.0.0.1:{port}"), "secret-token-123", MAX_FRAME_BYTES, Duration::from_millis(500)).await;
+        let head = server.await.unwrap();
+        let first = head.lines().next().unwrap();
+        assert_eq!(first, "GET /v1/ws HTTP/1.1", "请求行里不能有 token");
+        assert_eq!(head.matches("secret-token-123").count(), 1, "{head}");
+        assert!(head.to_ascii_lowercase().contains("authorization: bearer secret-token-123"));
     }
 
     #[test]

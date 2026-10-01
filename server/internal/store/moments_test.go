@@ -21,7 +21,7 @@ func TestCursorSameMillisecond(t *testing.T) {
 	const ts = 1_700_000_000_000
 	ids := []string{}
 	for i := 0; i < 5; i++ {
-		row, err := s.CreateMoment(ctx, uid, "x", nil, Visibility{Mode: VisAll})
+		row, err := s.CreateMoment(ctx, uid, "x", nil, Visibility{Mode: VisAll}, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

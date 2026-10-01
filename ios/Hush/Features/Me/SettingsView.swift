@@ -26,6 +26,16 @@ struct SettingsView: View {
                     SettingRow(icon: "lock.fill", tint: .indigo, title: "屏幕锁")
                 }
                 .accessibilityIdentifier("screenLockToggle")
+                if lock.lockEnabled {
+                    // 宽限时间：离开 App 不超过这么久再回来不用重新验证
+                    Picker(selection: $lock.graceSecs) {
+                        ForEach(ScreenLock.graceOptions, id: \.0) { Text($0.1).tag($0.0) }
+                    } label: {
+                        SettingRow(icon: "clock.fill", tint: .indigo, title: "自动锁定")
+                    }
+                    .pickerStyle(.navigationLink)
+                    .accessibilityIdentifier("lockGracePicker")
+                }
                 Toggle(isOn: $lock.privacyScreen) { SettingRow(icon: "eye.slash.fill", tint: .gray, title: "屏幕安全") }
                     .accessibilityIdentifier("privacyScreenToggle")
                 NavigationLink(value: Route.blocked) {

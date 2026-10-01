@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- debug：保持原状，允许明文（模拟器上的 http://10.0.2.2:8080 等本地开发服务器）。 -->
+<network-security-config xmlns:tools="http://schemas.android.com/tools">
+    <base-config tools:ignore="InsecureBaseConfiguration" cleartextTrafficPermitted="true" />
+</network-security-config>

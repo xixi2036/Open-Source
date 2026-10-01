@@ -75,18 +75,34 @@ pub fn image_dimensions(data: &[u8]) -> (u32, u32) {
     (0, 0)
 }
 
-/// 生成可安全用作文件名的片段。
+/// 文件名片段的字节上限（B3）。ext4 / f2fs 的文件名上限是 255 **字节**；附件缓存文件名还要加上
+/// 约 35 字节的前缀（`<32 位十六进制>_<序号>_`），留足余量。
+const SAFE_NAME_MAX_BYTES: usize = 150;
+
+/// 生成可安全用作文件名的片段：替换非法字符，按 **UTF-8 字节** 截到 150 字节以内并保留扩展名。
+/// （以前按字符截 80 个：80 个汉字是 240 字节，加上前缀就超过 255 字节，Android 上建文件直接失败。）
 pub fn safe_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    let trimmed = cleaned.trim_matches('.').to_string();
+    let trimmed = cleaned.trim_matches('.');
     if trimmed.is_empty() {
-        "file".to_string()
-    } else {
-        trimmed.chars().take(80).collect()
+        return "file".to_string();
     }
+    if trimmed.len() <= SAFE_NAME_MAX_BYTES {
+        return trimmed.to_string();
+    }
+    // 保留扩展名（最多 16 字节，超过就不当作扩展名）
+    let (stem, ext) = match trimmed.rfind('.') {
+        Some(i) if trimmed.len() - i <= 16 && i > 0 => (&trimmed[..i], &trimmed[i..]),
+        _ => (trimmed, ""),
+    };
+    let mut end = (SAFE_NAME_MAX_BYTES - ext.len()).min(stem.len());
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ext}", &stem[..end])
 }
 
 #[cfg(test)]
@@ -125,5 +141,28 @@ mod tests {
         assert_eq!(safe_file_name("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(safe_file_name("照片 1.jpg"), "照片_1.jpg");
         assert_eq!(safe_file_name(""), "file");
+    }
+
+    /// B3：长中文文件名按字节截断（整字符边界）并保留扩展名，加上缓存前缀后不超过 255 字节。
+    #[test]
+    fn long_cjk_names_fit_in_255_bytes() {
+        let name = format!("{}.pdf", "报告".repeat(60)); // 120 个汉字 = 360 字节
+        let safe = safe_file_name(&name);
+        assert!(safe.len() <= 150, "{}", safe.len());
+        assert!(safe.ends_with(".pdf"), "保留扩展名: {safe}");
+        assert!(safe.starts_with("报告报告"));
+        assert!(35 + safe.len() <= 255);
+        // 73 个汉字：以前正好越界
+        let s73 = safe_file_name(&"汉".repeat(73));
+        assert!(s73.len() <= 150 && s73.chars().all(|c| c == '汉'));
+        // emoji（4 字节）与没有扩展名、超长「扩展名」的情况
+        assert!(safe_file_name(&"😀".repeat(100)).len() <= 150);
+        assert!(safe_file_name(&format!("a.{}", "x".repeat(300))).len() <= 150);
+        // 短文件名不变
+        assert_eq!(safe_file_name("短名字.jpg"), "短名字.jpg");
+        // 真的能建出文件
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(format!("{}_0_{}", "a".repeat(32), safe));
+        std::fs::write(&p, b"x").unwrap();
     }
 }

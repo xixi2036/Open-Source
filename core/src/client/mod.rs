@@ -2,12 +2,17 @@
 
 mod account;
 mod attachments;
+#[cfg(test)]
+mod audit_tests;
 mod calls;
+mod events;
 mod groups;
 mod hooks;
 mod identity;
 mod keys;
 mod messaging;
+#[cfg(test)]
+mod perf_tests;
 mod receive;
 mod secure;
 mod social;
@@ -73,6 +78,9 @@ pub fn parse_conv(conv_id: &str) -> Result<ConvRef<'_>> {
     Err(HushError::invalid(format!("会话 id 无效: {conv_id}")))
 }
 
+/// 本地搜索最多返回的条数
+const SEARCH_LIMIT: usize = 200;
+
 /// kv 中记录会话阅后即焚设置最后变更时间的键。
 pub(crate) fn timer_key(conv_id: &str) -> String {
     format!("timer_at:{conv_id}")
@@ -126,26 +134,6 @@ impl Drop for KeyedGuard<'_> {
     }
 }
 
-/// 启动事件投递线程：按顺序把事件交给平台 `on_event`。回调在任何内部锁之外执行；
-/// 平台回调抛异常（UniFFI 转为 panic）时用 catch_unwind 兜住，只记日志，不影响后续事件与核心任务。
-fn spawn_event_dispatcher(listener: Arc<RwLock<Option<Arc<dyn EventListener>>>>) -> Result<std::sync::mpsc::Sender<CoreEvent>> {
-    let (tx, rx) = std::sync::mpsc::channel::<CoreEvent>();
-    std::thread::Builder::new()
-        .name("hushcore-events".into())
-        .spawn(move || {
-            // Inner 释放（发送端全部 drop）后 recv 返回错误，线程退出
-            while let Ok(ev) = rx.recv() {
-                let l = listener.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let Some(l) = l else { continue };
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.on_event(ev))).is_err() {
-                    tracing::warn!("平台 on_event 回调异常（已忽略）");
-                }
-            }
-        })
-        .map_err(|e| HushError::internal(format!("启动事件线程失败: {e}")))?;
-    Ok(tx)
-}
-
 pub struct Inner {
     pub files_dir: PathBuf,
     pub platform: String,
@@ -156,8 +144,8 @@ pub struct Inner {
     /// 登录态代数：token 每变一次加 1（见 `same_session`）
     auth_gen: AtomicU64,
     pub listener: Arc<RwLock<Option<Arc<dyn EventListener>>>>,
-    /// 事件队列：emit 只入队，由专门的 `hushcore-events` 线程在锁外投递给平台
-    events_tx: Mutex<std::sync::mpsc::Sender<CoreEvent>>,
+    /// 事件队列：emit 只入队，由专门的 `hushcore-events` 线程在锁外投递给平台（合并与上限见 `events.rs`）
+    events: events::EventQueue,
     /// 串行化所有 vodozemac 状态修改（账户、Olm/Megolm 会话）。持有期间不做网络请求。
     pub crypto_lock: tokio::sync::Mutex<()>,
     /// 串行化密钥上传（生成 → 落盘 → 上传 → 标记已发布），避免两次上传交错时把对方的密钥误标为已发布
@@ -166,6 +154,12 @@ pub struct Inner {
     pub run: Mutex<Option<RunHandle>>,
     pub calls: Mutex<HashMap<String, CallTrack>>,
     pub reset_sent: Mutex<HashMap<String, i64>>,
+    /// claim 被服务端拒绝（403 / 404）的用户 → (时间, 错误)：群 room_key 分发的负缓存（A11）
+    pub claim_refused: Mutex<HashMap<String, (i64, HushError)>>,
+    /// 待发送的送达回执（C3：攒批）
+    pub receipts: Mutex<receive::ReceiptQueue>,
+    /// 允许对公网地址使用明文 http（B1，默认 false）
+    allow_insecure_http: AtomicBool,
     pub replenishing: AtomicBool,
     pub stats: Stats,
     /// 信封 / 事件按 id 串行处理（WS 与 sync_now 可能同时拿到同一条）
@@ -213,7 +207,7 @@ impl Inner {
         }
         let auth: Option<AuthState> = store.kv_get_json("auth")?;
         let listener: Arc<RwLock<Option<Arc<dyn EventListener>>>> = Arc::new(RwLock::new(None));
-        let events_tx = spawn_event_dispatcher(listener.clone())?;
+        let events = events::EventQueue::start(listener.clone())?;
         Ok(Inner {
             files_dir,
             platform,
@@ -223,13 +217,16 @@ impl Inner {
             auth: RwLock::new(auth),
             auth_gen: AtomicU64::new(0),
             listener,
-            events_tx: Mutex::new(events_tx),
+            events,
             crypto_lock: tokio::sync::Mutex::new(()),
             key_upload: tokio::sync::Mutex::new(()),
             conn_state: Mutex::new(ConnectionState::Disconnected),
             run: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             reset_sent: Mutex::new(HashMap::new()),
+            claim_refused: Mutex::new(HashMap::new()),
+            receipts: Mutex::new(receive::ReceiptQueue::default()),
+            allow_insecure_http: AtomicBool::new(false),
             replenishing: AtomicBool::new(false),
             stats: Stats::default(),
             processing: KeyedLocks::default(),
@@ -252,7 +249,7 @@ impl Inner {
 
     /// 发出事件：只入队，不在调用方线程（可能持有 crypto_lock 等内部锁）里调用平台回调。
     pub fn emit(&self, e: CoreEvent) {
-        let _ = self.events_tx.lock().unwrap_or_else(|e| e.into_inner()).send(e);
+        self.events.push(e);
     }
 
     /// 发出 `MessageAdded`。`backlog` 只对收到的消息（含「无法解密」占位）有意义：积压或 HTTP 补拉时为 true；
@@ -280,6 +277,8 @@ impl Inner {
     /// `LoggedOut { reason: "session_expired" }`（C-G）。
     pub fn api(&self) -> Result<Api> {
         let a = self.auth()?;
+        // B1：已保存的登录态若指向公网明文 http（旧版本登录的），不再带着 token 发请求
+        crate::api::ensure_secure(&a.server_url, self.allow_insecure_http())?;
         let api = Api::new(self.http.clone(), a.server_url, Some(a.token.clone()));
         Ok(match self.self_ref.get().cloned() {
             Some(weak) => {
@@ -292,6 +291,15 @@ impl Inner {
             }
             None => api,
         })
+    }
+
+    /// 是否允许对公网地址使用明文 http（B1，默认不允许）。
+    pub fn allow_insecure_http(&self) -> bool {
+        self.allow_insecure_http.load(Ordering::Relaxed)
+    }
+
+    pub fn set_allow_insecure_http(&self, allow: bool) {
+        self.allow_insecure_http.store(allow, Ordering::Relaxed);
     }
 
     /// 清除登录态，但只有当前 token 仍是 `token` 时才清（旧登录态的请求晚到的 401 不能登出新的登录）。返回是否清除。
@@ -317,6 +325,7 @@ impl Inner {
         // 登录态换了（登出、换号、重新登录）：之前派生的后台任务作废
         if cur.as_ref().map(|c| &c.token) != a.as_ref().map(|c| &c.token) {
             self.auth_gen.fetch_add(1, Ordering::SeqCst);
+            self.forget_claim_refusal(None);
         }
         *cur = a;
         Ok(())
@@ -442,11 +451,18 @@ impl Inner {
         Ok(s)
     }
 
+    /// 会话列表。单个会话读不出来（A2：例如旧版本留下的坏会话 id、损坏的资料缓存）只跳过它并记日志，
+    /// 不让整个列表失败。
     pub fn conversations(&self, archived: bool) -> Result<Vec<ConversationSummary>> {
         let mut out = Vec::new();
         for r in self.store.list_convs()? {
-            if r.archived == archived {
-                out.push(self.conv_summary(r)?);
+            if r.archived != archived {
+                continue;
+            }
+            let id = r.conv_id.clone();
+            match self.conv_summary(r) {
+                Ok(s) => out.push(s),
+                Err(e) => tracing::warn!("会话 {id} 无法读取，已从列表中跳过: {e}"),
             }
         }
         Ok(out)
@@ -507,15 +523,8 @@ impl Inner {
         if q.is_empty() {
             return Ok(vec![]);
         }
-        Ok(self
-            .store
-            .all_messages()?
-            .into_iter()
-            .filter(|m| matches!(m.msg.body, StoredBody::Text { .. } | StoredBody::Attachments { .. }))
-            .filter(|m| m.msg.body.preview_text().to_lowercase().contains(&q))
-            .take(200)
-            .map(|m| self.msg_item(&m))
-            .collect())
+        // C2：流式扫描，够 200 条即停；附件只比对说明与文件名（见 `Store::search_messages`）
+        Ok(self.store.search_messages(&q, SEARCH_LIMIT)?.iter().map(|m| self.msg_item(m)).collect())
     }
 
     pub fn stat_inc(c: &AtomicU64) {
@@ -666,7 +675,9 @@ pub(crate) mod stub {
                     }
                     let body = buf[head_end..].to_vec();
                     hits.lock().unwrap().push((method.clone(), path.clone()));
-                    let (status, resp) = handler(&method, &path, &body);
+                    // 处理函数可能故意阻塞（模拟慢服务端）：放到阻塞线程池，不能卡住运行时的工作线程（会连定时器一起卡住）
+                    let (m2, p2) = (method.clone(), path.clone());
+                    let Ok((status, resp)) = tokio::task::spawn_blocking(move || handler(&m2, &p2, &body)).await else { return };
                     let (ctype, bytes) = match resp.strip_prefix(BINARY_MARK) {
                         Some(b64) => ("application/octet-stream", crate::util::b64d(b64).unwrap_or_default()),
                         None => ("application/json", resp.into_bytes()),
@@ -751,5 +762,116 @@ mod event_tests {
         }
         let (ev, _) = rx.recv_timeout(Duration::from_secs(5)).expect("回调在锁外执行，不应死锁");
         assert!(ev.contains("KeyChanged"), "{ev}");
+    }
+
+    struct Gate {
+        release: Mutex<mpsc::Receiver<()>>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl EventListener for Gate {
+        fn on_event(&self, event: CoreEvent) {
+            // 第一个事件卡住，直到测试放行：模拟平台回调很慢
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(format!("{event:?}").chars().take(24).collect());
+                seen.len() == 1
+            };
+            if first {
+                let _ = self.release.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }
+
+    /// C3：平台回调慢时，「请刷新」类事件在队列里合并；待投递事件有上限，超出时丢最早的可丢弃事件并补一个
+    /// `ConversationsChanged`；不可丢弃的事件（登出、来电、实时消息）全部保留且保持顺序。
+    #[tokio::test]
+    async fn refresh_events_coalesced_and_queue_bounded() {
+        let (inner, _dir) = test_inner();
+        let (tx, rx) = mpsc::channel();
+        let gate = Arc::new(Gate { release: Mutex::new(rx), seen: Mutex::new(Vec::new()) });
+        inner.set_listener(gate.clone());
+        inner.emit(CoreEvent::GroupsChanged); // 卡住投递线程
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for _ in 0..3000 {
+            inner.emit(CoreEvent::ConversationsChanged);
+            inner.emit(CoreEvent::FriendsChanged);
+        }
+        assert_eq!(inner.events.stats().0, 2, "3000 个刷新事件合并成各一个");
+
+        let removed = |i: usize| CoreEvent::MessageRemoved { conv_id: "u:bob".into(), message_id: format!("m{i}") };
+        for i in 0..events::EVENT_QUEUE_CAP + 500 {
+            inner.emit(removed(i));
+        }
+        inner.emit(CoreEvent::LoggedOut { reason: "x".into() });
+        inner.emit(CoreEvent::KeyChanged { user_id: "bob".into() });
+        let (len, dropped) = inner.events.stats();
+        assert!(len <= events::EVENT_QUEUE_CAP + 4, "队列有上限: {len}");
+        assert!(dropped >= 498, "{dropped}");
+
+        tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while inner.events.stats().0 > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen = gate.seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|e| e.starts_with("ConversationsChanged")).count(), 1);
+        assert_eq!(seen.iter().filter(|e| e.starts_with("FriendsChanged")).count(), 1);
+        // 不可丢弃的事件都在，且顺序不变
+        let pos = |p: &str| seen.iter().position(|e| e.starts_with(p)).unwrap_or_else(|| panic!("缺少 {p}"));
+        assert!(pos("LoggedOut") < pos("KeyChanged"));
+        assert!(seen.len() <= events::EVENT_QUEUE_CAP + 8);
+    }
+
+    /// C3：送达回执攒批——同一发送者的多条消息合成一条回执内容、一次 POST；没有会话时只 claim 一次。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delivery_receipts_are_batched() {
+        use crate::content::{Content, ContentBody};
+        let mut alice = vodozemac::olm::Account::new();
+        let keys = crate::crypto::olm::prepare_one_time_keys(&mut alice, 1);
+        let claim = serde_json::json!({
+            "user_id": "alice",
+            "identity_key": crate::crypto::olm::identity_key_b64(&alice),
+            "signing_key": crate::crypto::olm::signing_key_b64(&alice),
+            "device_generation": 1,
+            "one_time_key": {"key_id": keys[0].key_id, "key": keys[0].key, "signature": keys[0].signature},
+        })
+        .to_string();
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let p2 = posted.clone();
+        let srv = stub::start(Arc::new(move |m, p, b| match (m, p) {
+            ("POST", p) if p.starts_with("/v1/keys/claim/") => (200, claim.clone()),
+            ("POST", "/v1/messages") => {
+                p2.lock().unwrap().push(serde_json::from_slice(b).unwrap());
+                (200, r#"{"results":[]}"#.into())
+            }
+            _ => (404, r#"{"error":"not_found","message":"stub"}"#.into()),
+        }))
+        .await;
+        let (inner, _dir) = test_inner_at(&srv.url);
+        published_account(&inner);
+        for i in 0..120 {
+            let mut c = Content::new(ContentBody::Text { text: format!("积压 {i}"), quote: None, mentions: vec![] }, None, 0);
+            c.id = format!("m-{i}");
+            let from = if i % 3 == 0 { "carol" } else { "alice" };
+            inner
+                .handle_incoming(secure::Incoming { from: from.into(), content: c, server_ts: 1_000 + i, via_group: None, olm_session_id: Some("s".into()), backlog: true })
+                .await
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while posted.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let posts = posted.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1, "120 条消息的回执应合成一次 POST");
+        let msgs = posts[0]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "每个发送者一条回执内容");
+        assert!(msgs.iter().all(|m| m["urgent"] == false));
+        assert_eq!(srv.count("POST", "/v1/keys/claim/alice"), 1);
+        assert_eq!(srv.count("POST", "/v1/keys/claim/carol"), 1);
     }
 }

@@ -37,7 +37,11 @@ impl Store {
             .query_row("SELECT plaintext FROM inbox WHERE envelope_id=?1", [envelope_id], |r| r.get(0))
             .optional()?;
         let Some(Some(blob)) = v else { return Ok(None) };
-        match self.cipher.open(LABEL_INBOX, &blob).and_then(|p| serde_json::from_slice::<InboxPlain>(&p).map_err(HushError::from)) {
+        // 日志不带解析错误的原文：serde 的错误文本可能带出明文片段
+        let opened = self.cipher.open(LABEL_INBOX, &blob).and_then(|p| {
+            serde_json::from_slice::<InboxPlain>(&p).map_err(|e| HushError::storage(format!("记录格式错误（{:?}）", e.classify())))
+        });
+        match opened {
             Ok(p) => Ok(Some(p)),
             Err(e) => {
                 tracing::warn!("收件箱 {envelope_id} 的明文无法读取，按未解密处理: {e}");

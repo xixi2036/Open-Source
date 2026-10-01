@@ -80,17 +80,48 @@ struct LocalImage<Placeholder: View>: View {
 }
 
 enum ImageUtil {
-    /// 压缩到长边 ≤ maxSide，JPEG 质量 0.8，写入临时文件，返回 (路径, 宽, 高)
-    static func compressToJPEG(_ data: Data, maxSide: CGFloat = 2048) -> (URL, Int, Int)? {
-        guard let img = UIImage(data: data) else { return nil }
-        let resized = resize(img, maxSide: maxSide)
-        guard let jpg = resized.jpegData(compressionQuality: 0.8) else { return nil }
-        let url = AppPaths.newOutboxFile(ext: "jpg")
-        do { try jpg.write(to: url) } catch { return nil }
-        return (url, Int(resized.size.width * resized.scale), Int(resized.size.height * resized.scale))
+    /// 压缩到长边 ≤ maxSide，JPEG 质量 0.8，写入临时文件，返回 (路径, 宽, 高)。
+    /// C4：用 ImageIO 直接按目标尺寸降采样解码，不把 4800 万像素的原图整张解进内存；可在任意线程调用。
+    nonisolated static func compressToJPEG(_ data: Data, maxSide: CGFloat = 2048) -> (URL, Int, Int)? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+        return compress(src, maxSide: maxSide)
     }
 
-    static func resize(_ img: UIImage, maxSide: CGFloat) -> UIImage {
+    /// 同上，直接从文件读取（拍照得到的文件等）
+    nonisolated static func compressToJPEG(fileURL: URL, maxSide: CGFloat = 2048) -> (URL, Int, Int)? {
+        guard let src = CGImageSourceCreateWithURL(fileURL as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+        return compress(src, maxSide: maxSide)
+    }
+
+    private nonisolated static func compress(_ src: CGImageSource, maxSide: CGFloat) -> (URL, Int, Int)? {
+        guard let cg = downsample(src, maxPixel: maxSide) else { return nil }
+        let url = AppPaths.newOutboxFile(ext: "jpg")
+        guard let dst = CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil) else { return nil }
+        // 方向已在降采样时应用（WithTransform），输出不带 EXIF：位置等元数据不会随图片发出去
+        CGImageDestinationAddImage(dst, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+        guard CGImageDestinationFinalize(dst) else { return nil }
+        return (url, cg.width, cg.height)
+    }
+
+    /// 按最长边降采样解码（已应用 EXIF 方向）；原图不大于 maxPixel 时按原尺寸解码
+    nonisolated static func downsample(_ src: CGImageSource, maxPixel: CGFloat) -> CGImage? {
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maxPixel)),
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+    }
+
+    /// 降采样后的像素尺寸（不解码图像数据，只读头部）
+    nonisolated static func pixelSize(_ src: CGImageSource) -> CGSize? {
+        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? CGFloat, let h = props[kCGImagePropertyPixelHeight] as? CGFloat else { return nil }
+        return CGSize(width: w, height: h)
+    }
+
+    nonisolated static func resize(_ img: UIImage, maxSide: CGFloat) -> UIImage {
         let w = img.size.width * img.scale, h = img.size.height * img.scale
         let longest = max(w, h)
         let scale = longest > maxSide ? maxSide / longest : 1
@@ -102,9 +133,9 @@ enum ImageUtil {
         }
     }
 
-    /// 小缩略图（随消息加密发送，对方先显示模糊图）
-    static func thumbnail(_ url: URL) -> Data? {
-        guard let img = ImageCache.image(url.path, maxPixel: 64) else { return nil }
-        return img.jpegData(compressionQuality: 0.5)
+    /// 小缩略图（随消息加密发送，对方先显示模糊图）。会读文件并解码，不要在主线程调用。
+    nonisolated static func thumbnail(_ url: URL, maxPixel: CGFloat = 64) -> Data? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = downsample(src, maxPixel: maxPixel) else { return nil }
+        return UIImage(cgImage: cg).jpegData(compressionQuality: 0.5)
     }
 }

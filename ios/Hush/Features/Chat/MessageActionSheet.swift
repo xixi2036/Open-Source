@@ -19,13 +19,20 @@ struct MessageActionSheet: View {
     }
 
     /// 转发：未撤回的文字，或已上传的附件（发送中 / 失败的附件还没有服务端密文）
-    private var canForward: Bool {
-        guard !message.deleted else { return false }
-        switch message.body {
-        case .text: return true
-        case .attachments: return !(message.isOutgoing && (message.status == .sending || message.status == .failed))
-        default: return false
-        }
+    private var canForward: Bool { ChatModel.forwardable(message) }
+    private var canSelectText: Bool { text != nil && !message.deleted }
+    private var canMultiSelect: Bool { ChatModel.selectable(message) }
+
+    /// 菜单行数（决定面板高度）
+    private var rowCount: Int {
+        var n = 1   // 删除
+        if canInteract { n += 1 }
+        if canForward { n += 1 }
+        if text != nil { n += 1 }
+        if canSelectText { n += 1 }
+        if canMultiSelect { n += 1 }
+        if model.canRecall(message) { n += 1 }
+        return n
     }
 
     var body: some View {
@@ -55,6 +62,12 @@ struct MessageActionSheet: View {
                 if let text {
                     action("复制", "doc.on.doc", id: "action_copy") { UIPasteboard.general.string = text; HushCore.shared.toast = "已复制" }
                 }
+                if canSelectText {
+                    action("选择文字", "text.cursor", id: "action_select_text") { model.pendingSelectText = message }
+                }
+                if canMultiSelect {
+                    action("多选", "checkmark.circle", id: "action_multi_select") { model.beginSelecting(message) }
+                }
                 if model.canRecall(message) {
                     action("撤回", "arrow.uturn.backward", id: "action_recall") { model.recall(message) }
                 }
@@ -65,7 +78,7 @@ struct MessageActionSheet: View {
             Spacer(minLength: 0)
         }
         .padding(.top, 8)
-        .presentationDetents([.height(canInteract ? (canForward ? 378 : 330) : 120)])
+        .presentationDetents([.height(CGFloat(rowCount) * 48 + (canInteract ? 84 : 0) + 48)])
         .presentationDragIndicator(.visible)
     }
 
@@ -80,7 +93,7 @@ struct MessageActionSheet: View {
                 Image(systemName: icon)
             }
             .foregroundStyle(role == .destructive ? Theme.danger : Theme.textPrimary)
-            .padding(.horizontal, 16).frame(height: 48)
+            .padding(.horizontal, 16).frame(minHeight: 48)
             .contentShape(Rectangle())
         }
         .accessibilityIdentifier(id)

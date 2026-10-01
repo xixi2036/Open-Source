@@ -10,8 +10,11 @@ struct MessageTextView: UIViewRepresentable {
     @Binding var text: String
     /// 程序改写文本后应放置的光标（UTF-16）；应用后置 nil
     @Binding var pendingCursor: Int?
+    /// 第一次获得焦点时把光标放到文本末尾（恢复草稿后使用，C1）；生效后置 false
+    var cursorToEndOnFocus: Binding<Bool> = .constant(false)
     var placeholder: String
-    var font: UIFont = .systemFont(ofSize: 16)
+    /// A5：跟随系统字号（动态字体）
+    var font: UIFont = UIFontMetrics(forTextStyle: .callout).scaledFont(for: .systemFont(ofSize: 16))
     var maxLines: Int = 5
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -20,6 +23,7 @@ struct MessageTextView: UIViewRepresentable {
         let v = UITextView()
         v.delegate = context.coordinator
         v.font = font
+        v.adjustsFontForContentSizeCategory = true
         v.textColor = UIColor(Theme.textPrimary)
         v.tintColor = UIColor(Theme.accent)
         v.backgroundColor = .clear
@@ -53,7 +57,7 @@ struct MessageTextView: UIViewRepresentable {
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView v: UITextView, context: Context) -> CGSize? {
         let width = proposal.width ?? 240
-        let line = ceil(font.lineHeight)
+        let line = ceil((v.font ?? font).lineHeight)
         let fit = v.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
         return CGSize(width: width, height: min(max(ceil(fit), line), line * CGFloat(maxLines)))
     }
@@ -64,6 +68,18 @@ struct MessageTextView: UIViewRepresentable {
 
         func textViewDidChange(_ v: UITextView) {
             if parent.text != v.text { parent.text = v.text }
+        }
+
+        func textViewDidBeginEditing(_ v: UITextView) {
+            guard parent.cursorToEndOnFocus.wrappedValue else { return }
+            // 点击输入框时系统会把光标放到点击处：等这次点击处理完再移到末尾
+            DispatchQueue.main.async { [weak v, parent] in
+                guard let v else { return }
+                let end = (v.text as NSString).length
+                v.selectedRange = NSRange(location: end, length: 0)
+                v.scrollRangeToVisible(v.selectedRange)
+                parent.cursorToEndOnFocus.wrappedValue = false
+            }
         }
     }
 }

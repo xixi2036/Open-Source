@@ -56,9 +56,10 @@ class AuthViewModel(app: Application) : AndroidViewModel(app) {
     fun setName(v: String) = _state.update { it.copy(name = v, error = null) }
 
     fun submitServer() {
-        val url = _state.value.server.trim().trimEnd('/')
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            _state.update { it.copy(error = "地址需以 http:// 或 https:// 开头") }; return
+        // B1：正式版对公网地址强制 https，http 只允许回环与私有网段；debug 不限制
+        val url = when (val r = com.hush.app.util.ServerUrlPolicy.check(_state.value.server, allowAnyCleartext = com.hush.app.BuildConfig.DEBUG)) {
+            is com.hush.app.util.ServerUrlPolicy.Result.Ok -> r.url
+            is com.hush.app.util.ServerUrlPolicy.Result.Rejected -> { _state.update { it.copy(error = r.reason) }; return }
         }
         HushCore.prefs.lastServerUrl = url
         _state.update { it.copy(server = url, step = AuthStep.EMAIL, error = null) }

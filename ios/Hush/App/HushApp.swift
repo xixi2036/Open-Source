@@ -16,17 +16,24 @@ struct HushApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
+                .onAppear { OverlayWindows.shared.install() }
                 .onChange(of: scenePhase) { _, phase in
                     switch phase {
                     case .active:
+                        lock.onForeground()
+                        lock.sceneActive = true
                         core.onForeground()
-                        lock.unlock()
                     case .background:
-                        core.appActive = false
+                        lock.sceneActive = false
+                        core.onBackground()
                         lock.onBackground()
                     default:
-                        core.appActive = false
+                        // B3：.inactive（下拉通知中心、权限弹窗、Face ID 验证、应用切换器）不算进入后台：
+                        // 不取消录音、不重跑同步、不改变通知抑制；只盖上遮罩，避免切换器快照露出内容
+                        lock.sceneActive = false
                     }
+                    // 遮罩必须在本次运行循环内就位（系统随后就会截取应用切换器快照）
+                    OverlayWindows.shared.refresh()
                 }
         }
     }

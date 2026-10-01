@@ -14,10 +14,19 @@ struct MomentsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showCompose = true } label: { Image(systemName: "camera.fill") }
+                        .accessibilityLabel("发布动态")
                         .accessibilityIdentifier("composeMoment")
                 }
             }
-            .task { if !model.loaded { await model.refresh() } }
+            .task { await model.autoRefresh() }
+            // 每次切到朋友圈 Tab（或从下一级页面返回）自动拉取最新动态
+            .onAppear { Task { await model.autoRefresh() } }
+            .onChange(of: Router.shared.tab) { _, tab in
+                if tab == .moments { Task { await model.autoRefresh() } }
+            }
+            .onChange(of: core.appActive) { _, active in
+                if active, Router.shared.tab == .moments { Task { await model.autoRefresh() } }
+            }
             .sheet(isPresented: $showCompose) {
                 ComposeMomentView { m in model.inserted(m) }
             }
@@ -33,7 +42,7 @@ struct MomentsView: View {
                         if let n = core.moments.notes.first {
                             AvatarView(seed: n.from.id, name: n.from.name, avatarId: n.from.avatarId, size: 26)
                         }
-                        Text("\(core.moments.newNoteCount) 条新消息").font(.system(size: 14, weight: .medium)).foregroundStyle(.white)
+                        Text("\(core.moments.newNoteCount) 条新消息").font(Fonts.sized(14, weight: .medium)).foregroundStyle(.white)
                     }
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.25)))
@@ -66,7 +75,7 @@ struct MomentsCover: View {
                     Image(systemName: "sparkles").font(.system(size: 80)).foregroundStyle(.white.opacity(0.15)).padding(30)
                 }
             HStack(alignment: .bottom, spacing: 12) {
-                Text(name).font(.system(size: 18, weight: .semibold)).foregroundStyle(.white)
+                Text(name).font(Fonts.sized(18, weight: .semibold)).foregroundStyle(.white)
                     .shadow(radius: 2).padding(.bottom, 26)
                 AvatarView(seed: userId, name: name, avatarId: avatarId, size: 72)
                     .overlay(Circle().stroke(.white, lineWidth: 2))
@@ -138,7 +147,7 @@ struct MomentsFeed: View {
                 if let t = model.commentTarget {
                     HStack(spacing: 8) {
                         TextField(t.replyTo.map { "回复 \($0.name)" } ?? "评论", text: $commentText)
-                            .padding(.horizontal, 12).frame(height: 38)
+                            .padding(.horizontal, 12).frame(minHeight: 38)
                             .background(RoundedRectangle(cornerRadius: 19).fill(Theme.surface))
                             .focused($commentFocused)
                             .submitLabel(.send)
@@ -263,7 +272,7 @@ struct MomentNotificationsView: View {
         HStack(alignment: .top, spacing: 12) {
             AvatarView(seed: n.from.id, name: n.from.name, avatarId: n.from.avatarId, size: 44)
             VStack(alignment: .leading, spacing: 4) {
-                Text(n.from.name).font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.accent)
+                Text(n.from.name).font(Fonts.sized(15, weight: .semibold)).foregroundStyle(Theme.accent)
                 if n.kind == .like {
                     Image(systemName: "heart.fill").foregroundStyle(Theme.danger)
                 } else {

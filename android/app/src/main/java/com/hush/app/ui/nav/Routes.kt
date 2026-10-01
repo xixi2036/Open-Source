@@ -8,7 +8,7 @@ object Routes {
     const val CHAT = "chat/{convId}?msg={msg}"
     const val CHAT_SETTINGS = "chatSettings/{convId}"
     const val SAFETY = "safety/{userId}"
-    const val IMAGE = "image?path={path}"
+    const val IMAGE = "image?path={path}&conv={conv}"
     const val ARCHIVED = "archived"
     const val SEARCH = "search"
     const val NEW_CHAT = "newChat"
@@ -33,7 +33,8 @@ object Routes {
     fun chat(convId: String, messageId: String? = null) = if (messageId == null) "chat/${enc(convId)}" else "chat/${enc(convId)}?msg=${enc(messageId)}"
     fun chatSettings(convId: String) = "chatSettings/${enc(convId)}"
     fun safety(userId: String) = "safety/${enc(userId)}"
-    fun image(path: String) = "image?path=${enc(path)}"
+    /** [convId] 非空时查看器可左右滑动浏览同会话的图片。 */
+    fun image(path: String, convId: String? = null) = if (convId == null) "image?path=${enc(path)}" else "image?path=${enc(path)}&conv=${enc(convId)}"
     fun addMembers(groupId: String) = "addMembers/${enc(groupId)}"
     fun profile(userId: String) = "profile/${enc(userId)}"
     fun scan(safetyUser: String? = null) = if (safetyUser == null) "scan" else "scan?safetyUser=${enc(safetyUser)}"

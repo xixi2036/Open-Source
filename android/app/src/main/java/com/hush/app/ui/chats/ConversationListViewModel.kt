@@ -27,7 +27,11 @@ data class ConvListState(
 class ConversationListViewModel(private val archived: Boolean) : ViewModel() {
     private val _state = MutableStateFlow(ConvListState())
     val state: StateFlow<ConvListState> = _state
-    private val reloader = Coalescer(viewModelScope) { load() }
+    // C1：事件密集时（重连补拉、群聊刷屏、逐条回执）不必每个事件都全量重载，合并为至多每 300ms 一次
+    private val reloader = Coalescer(viewModelScope, RELOAD_GAP_MS) { load() }
+    /** 归档会话数单独缓存：只有会话集合 / 归档状态可能变化时才重新统计，消息状态更新不重算。 */
+    @Volatile private var archivedDirty = true
+    @Volatile private var archivedCache = 0
     /** 按 (会话, 用户) 记录并 15 秒过期，与聊天页一致；丢失 typing=false 时不会一直显示“正在输入…”。 */
     private val typingTracker = TypingTracker()
     private var typingRefreshJob: Job? = null
@@ -41,8 +45,8 @@ class ConversationListViewModel(private val archived: Boolean) : ViewModel() {
                         if (!ev.message.isOutgoing) { typingTracker.clear(ev.convId, ev.message.senderId); publishTyping() }
                         reload()
                     }
-                    is CoreEvent.ConversationsChanged, is CoreEvent.MessageUpdated,
-                    is CoreEvent.MessageRemoved, is CoreEvent.GroupsChanged, is CoreEvent.FriendsChanged -> reload()
+                    is CoreEvent.ConversationsChanged, is CoreEvent.GroupsChanged -> { archivedDirty = true; reload() }
+                    is CoreEvent.MessageUpdated, is CoreEvent.MessageRemoved, is CoreEvent.FriendsChanged -> reload()
                     is CoreEvent.Typing -> if (ev.userId != HushCore.myId) {
                         typingTracker.onTyping(ev.convId, ev.userId, ev.typing); publishTyping()
                     }
@@ -50,6 +54,11 @@ class ConversationListViewModel(private val archived: Boolean) : ViewModel() {
                 }
             }
         }
+    }
+
+    init {
+        // B13：事件流丢过事件时重新加载
+        viewModelScope.launch { HushCore.resync.collect { archivedDirty = true; reload() } }
     }
 
     private fun publishTyping() {
@@ -65,21 +74,32 @@ class ConversationListViewModel(private val archived: Boolean) : ViewModel() {
         val (list, archivedCount) = withContext(Dispatchers.IO) {
             runCatching {
                 val l = HushCore.client.conversations(archived)
-                val a = if (archived) 0 else HushCore.client.conversations(true).size
-                l to a
-            }.getOrDefault(emptyList<ConversationSummary>() to 0)
+                if (!archived && archivedDirty) {
+                    archivedDirty = false
+                    archivedCache = HushCore.client.conversations(true).size
+                }
+                l to (if (archived) 0 else archivedCache)
+            }.getOrElse { archivedDirty = true; emptyList<ConversationSummary>() to 0 }
         }
         val sorted = list.sortedWith(compareByDescending<ConversationSummary> { it.pinned }.thenByDescending { it.lastActivityTs })
         _state.update { it.copy(items = sorted, archivedCount = archivedCount, loaded = true) }
     }
 
     private fun act(block: () -> Unit) {
-        viewModelScope.launch(Dispatchers.IO) { runCatching(block); reload() }
+        viewModelScope.launch(Dispatchers.IO) { runCatching(block); archivedDirty = true; reload() }
     }
 
     fun setPinned(id: String, v: Boolean) = act { HushCore.client.setPinned(id, v) }
     fun setMuted(id: String, v: Boolean) = act { HushCore.client.setMuted(id, v) }
     fun setArchived(id: String, v: Boolean) = act { HushCore.client.setArchived(id, v) }
     /** U1：核心删除会话（本地消息、附件缓存、草稿与会话行）；群会话不退群，有新消息时重新出现。 */
-    fun delete(id: String) = act { HushCore.client.deleteConversation(id) }
+    fun delete(id: String) = act {
+        HushCore.client.deleteConversation(id)
+        // C9：会话删除后它的通知不能留在通知栏（点了会打开一个空会话）
+        com.hush.app.service.Notifier.cancelConversation(HushCore.appContext, id)
+    }
+
+    private companion object {
+        const val RELOAD_GAP_MS = 300L
+    }
 }

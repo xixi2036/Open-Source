@@ -25,6 +25,7 @@ struct MeView: View {
                             Image(systemName: "qrcode").font(.system(size: 20)).foregroundStyle(Theme.textSecondary)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("我的二维码")
                         .accessibilityIdentifier("meQRButton")
                     }
                     .padding(.vertical, 8)

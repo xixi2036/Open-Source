@@ -82,7 +82,7 @@ fun AuthScreen(vm: AuthViewModel = viewModel()) {
                     title = "服务器地址", desc = "本地部署的 Hush 服务器地址", onBack = { vm.back() },
                     button = "下一步", busy = false, error = s.error, onNext = vm::submitServer,
                 ) {
-                    Field(s.server, vm::setServer, "http://10.0.2.2:8080", KeyboardType.Uri, "server", vm::submitServer)
+                    Field(s.server, vm::setServer, if (com.hush.app.BuildConfig.DEBUG) "http://10.0.2.2:8080" else "https://hush.example.com", KeyboardType.Uri, "server", vm::submitServer)
                 }
                 AuthStep.EMAIL -> StepPage(
                     title = "输入你的邮箱", desc = "我们会向该邮箱发送 6 位验证码", onBack = { vm.back() },

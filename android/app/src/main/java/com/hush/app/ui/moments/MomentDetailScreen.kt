@@ -1,5 +1,7 @@
 package com.hush.app.ui.moments
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.hush.app.util.Savers
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -129,11 +131,15 @@ fun MomentDetailScreen(momentId: String, onBack: () -> Unit, onImage: (String) -
     val s by vm.state.collectAsState()
     com.hush.app.util.ToastCollector(vm.toast)
     androidx.compose.runtime.LaunchedEffect(s.deleted) { if (s.deleted) onBack() }
-    var commenting by remember { mutableStateOf<Pair<Moment, Comment?>?>(null) }
+    // A4：正在评论的 (动态 id, 被回复的评论 id) 可跨重建保留；对象每次从当前列表里取
+    var commentingIds by rememberSaveable(stateSaver = Savers.IdPair) { mutableStateOf<Pair<String, String?>?>(null) }
+    val commenting: Pair<Moment, Comment?>? = commentingIds?.let { (mid, cid) ->
+        listOfNotNull(s.moment).firstOrNull { it.id == mid }?.let { m -> m to cid?.let { id -> m.comments.firstOrNull { it.id == id } } }
+    }
     val actions = remember(vm) {
         MomentActions(
             onLike = vm::toggleLike,
-            onComment = { m, c -> commenting = m to c },
+            onComment = { m, c -> commentingIds = m.id to c?.id },
             onDeleteComment = { m, c -> vm.deleteComment(m, c.id) },
             onDelete = vm::delete,
             onImage = onImage,
@@ -154,8 +160,8 @@ fun MomentDetailScreen(momentId: String, onBack: () -> Unit, onImage: (String) -
             CommentBar(
                 hint = if (c != null) "回复 ${c.author.name}" else "评论",
                 modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
-                onSend = { text -> vm.comment(m, text, c?.author?.id); commenting = null },
-                onDismiss = { commenting = null },
+                onSend = { text -> vm.comment(m, text, c?.author?.id); commentingIds = null },
+                onDismiss = { commentingIds = null },
             )
         }
     }

@@ -36,8 +36,17 @@ enum ForwardTargets {
 /// 转发：多选会话 / 好友（可搜索），确认后调用核心 forward_message。
 /// 部分目标发送失败时提示，可一键重发失败的那几条（也可以之后在对应会话里点气泡旁的重发）。
 struct ForwardSheet: View {
-    let message: MessageItem
+    /// 要转发的消息（多选时有多条，按时间顺序逐条转发）
+    let messages: [MessageItem]
+    var onDone: () -> Void = {}
     var core = HushCore.shared
+
+    init(message: MessageItem) { self.messages = [message] }
+    init(messages: [MessageItem], onDone: @escaping () -> Void = {}) {
+        self.messages = messages
+        self.onDone = onDone
+    }
+
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
     @State private var selected: [String] = []
@@ -89,7 +98,7 @@ struct ForwardSheet: View {
             }
             .alert("有 \(failed.count) 个会话转发失败", isPresented: $showFailed) {
                 Button("重发") { resendFailed() }.accessibilityIdentifier("forwardRetry")
-                Button("稍后", role: .cancel) { dismiss() }
+                Button("稍后", role: .cancel) { onDone(); dismiss() }
             } message: {
                 Text("失败的消息保留在对应会话中，也可以稍后点气泡旁的红色感叹号重发")
             }
@@ -103,7 +112,12 @@ struct ForwardSheet: View {
     private var preview: some View {
         HStack(spacing: 8) {
             Image(systemName: "arrowshape.turn.up.right").foregroundStyle(Theme.accent)
-            Text(MessagePreview.text(message)).font(Fonts.secondary).foregroundStyle(Theme.textSecondary).lineLimit(2)
+            if messages.count == 1, let m = messages.first {
+                Text(MessagePreview.text(m)).font(Fonts.secondary).foregroundStyle(Theme.textSecondary).lineLimit(2)
+            } else {
+                Text("逐条转发 \(messages.count) 条消息").font(Fonts.secondary).foregroundStyle(Theme.textSecondary)
+                    .accessibilityIdentifier("forwardCount")
+            }
         }
     }
 
@@ -126,21 +140,31 @@ struct ForwardSheet: View {
 
     private func send() {
         sending = true
-        let ids = selected, mid = message.id
+        let ids = selected, mids = messages.map(\.id)
         Task {
             defer { sending = false }
-            do {
-                let result = try await core.chats.forward(mid, to: ids)
-                let bad = result.filter { $0.status == .failed }
-                if bad.isEmpty {
-                    core.toast = "已转发"
-                    dismiss()
-                } else {
-                    failed = bad
-                    showFailed = true
+            var bad: [MessageItem] = []
+            var errors: [String] = []
+            // 逐条转发，保持原来的先后顺序
+            for mid in mids {
+                do {
+                    let result = try await core.chats.forward(mid, to: ids)
+                    bad += result.filter { $0.status == .failed }
+                } catch {
+                    errors.append(describe(error))
                 }
-            } catch {
-                core.toast = describe(error)
+            }
+            if let first = errors.first {
+                core.toast = errors.count == mids.count ? first : "有 \(errors.count) 条消息转发失败：\(first)"
+                if errors.count == mids.count { return }
+            }
+            if bad.isEmpty {
+                if errors.isEmpty { core.toast = "已转发" }
+                onDone()
+                dismiss()
+            } else {
+                failed = bad
+                showFailed = true
             }
         }
     }
@@ -148,6 +172,7 @@ struct ForwardSheet: View {
     private func resendFailed() {
         let ids = failed.map(\.id)
         let chats = core.chats
+        onDone()
         dismiss()
         core.run {
             var stillFailed = 0

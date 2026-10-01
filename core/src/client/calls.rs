@@ -59,7 +59,7 @@ impl Inner {
         let c = Content::new(
             ContentBody::Call {
                 call_id: signal.call_id.clone(),
-                action: signal.action,
+                action: Some(signal.action),
                 video: signal.video,
                 sdp: signal.sdp.clone(),
                 candidates: if signal.candidates.is_empty() { None } else { Some(signal.candidates.clone()) },
@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn offer(call_id: &str) -> ContentBody {
-        ContentBody::Call { call_id: call_id.into(), action: CallAction::Offer, video: false, sdp: Some("v=0".into()), candidates: None }
+        ContentBody::Call { call_id: call_id.into(), action: Some(CallAction::Offer), video: false, sdp: Some("v=0".into()), candidates: None }
     }
 
     #[tokio::test]

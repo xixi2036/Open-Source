@@ -1,5 +1,7 @@
 package com.hush.app.ui.moments
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.hush.app.util.Savers
 import androidx.compose.foundation.background
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -93,7 +95,11 @@ fun MomentsScreen(
     val s by vm.state.collectAsState()
     val unseen by MomentNotifStore.unseen.collectAsState()
     val listState = rememberLazyListState()
-    var commenting by remember { mutableStateOf<Pair<Moment, Comment?>?>(null) }
+    // A4：正在评论的 (动态 id, 被回复的评论 id) 可跨重建保留；对象每次从当前列表里取
+    var commentingIds by rememberSaveable(stateSaver = Savers.IdPair) { mutableStateOf<Pair<String, String?>?>(null) }
+    val commenting: Pair<Moment, Comment?>? = commentingIds?.let { (mid, cid) ->
+        s.items.firstOrNull { it.id == mid }?.let { m -> m to cid?.let { id -> m.comments.firstOrNull { it.id == id } } }
+    }
     com.hush.app.util.ToastCollector(vm.toast)
     LaunchedEffect(reloadKey) { vm.reloadIfNeeded(reloadKey) }
     val nearEnd by remember { derivedStateOf { (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0) >= listState.layoutInfo.totalItemsCount - 2 } }
@@ -102,7 +108,7 @@ fun MomentsScreen(
     val actions = remember(vm) {
         MomentActions(
             onLike = vm::toggleLike,
-            onComment = { m, c -> commenting = m to c },
+            onComment = { m, c -> commentingIds = m.id to c?.id },
             onDeleteComment = { m, c -> vm.deleteComment(m, c.id) },
             onDelete = vm::delete,
             onImage = onImage,
@@ -168,8 +174,8 @@ fun MomentsScreen(
             CommentBar(
                 hint = if (c != null) "回复 ${c.author.name}" else "评论",
                 modifier = Modifier.align(Alignment.BottomCenter),
-                onSend = { text -> vm.comment(m, text, c?.author?.id); commenting = null },
-                onDismiss = { commenting = null },
+                onSend = { text -> vm.comment(m, text, c?.author?.id); commentingIds = null },
+                onDismiss = { commentingIds = null },
             )
         }
     }
@@ -203,7 +209,7 @@ private const val COVER_HEIGHT = 300
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun CommentBar(hint: String, modifier: Modifier, onSend: (String) -> Unit, onDismiss: () -> Unit) {
-    var text by remember { mutableStateOf("") }
+    var text by rememberSaveable { mutableStateOf("") }
     val focus = remember { FocusRequester() }
     LaunchedEffect(Unit) { focus.requestFocus() }
     DebugTextSink { text = it }

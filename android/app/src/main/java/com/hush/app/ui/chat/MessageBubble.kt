@@ -1,5 +1,12 @@
 package com.hush.app.ui.chat
 
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.TextLinkStyles
 import android.graphics.BitmapFactory
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -87,7 +94,24 @@ class BubbleActions(
     val onFileClick: (MessageItem, Int) -> Unit,
     val onResend: (MessageItem) -> Unit,
     val onReactionClick: (MessageItem, String) -> Unit,
+    /** 视频附件：下载后用系统播放器打开。 */
+    val onVideoClick: (MessageItem, Int) -> Unit = { _, _ -> },
+    /** 下载失败 / 未自动下载的附件：点按重试。 */
+    val onRetryDownload: (MessageItem, Int) -> Unit = { _, _ -> },
+    val onLinkClick: (String) -> Unit = {},
+    /** 多选模式下点按整行切换选中。 */
+    val onToggleSelect: (MessageItem) -> Unit = {},
 )
+
+/** 行内用到的、随状态变化的上下文（下载状态、多选）。 */
+data class RowContext(
+    val downloads: Map<String, DownloadState> = emptyMap(),
+    val selecting: Boolean = false,
+    val selected: Boolean = false,
+)
+
+private val LocalRowContext = androidx.compose.runtime.compositionLocalOf { RowContext() }
+private val LocalBubbleActions = androidx.compose.runtime.staticCompositionLocalOf<BubbleActions?> { null }
 
 /** 居中灰字（系统消息、撤回提示、日期分隔）。 */
 @Composable
@@ -105,7 +129,32 @@ fun CenterNote(text: String, italic: Boolean = false, pill: Boolean = false) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun MessageRow(m: MessageItem, isGroup: Boolean, showSenderHeader: Boolean, actions: BubbleActions, highlight: Boolean = false) {
+fun MessageRow(m: MessageItem, isGroup: Boolean, showSenderHeader: Boolean, actions: BubbleActions, highlight: Boolean = false, ctx: RowContext = RowContext()) {
+    androidx.compose.runtime.CompositionLocalProvider(LocalRowContext provides ctx, LocalBubbleActions provides actions) {
+        if (ctx.selecting && Selection.selectable(m)) {
+            // 多选：左侧勾选框；整行盖一层点击区域，点哪里都是切换选中（不触发气泡自身的点击 / 长按）
+            Box {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = ctx.selected, onCheckedChange = null,
+                        colors = CheckboxDefaults.colors(checkedColor = Hush.colors.accent),
+                        modifier = Modifier.padding(start = 12.dp).testTag("select_${m.id}"),
+                    )
+                    Box(Modifier.weight(1f)) { MessageRowContent(m, isGroup, showSenderHeader, actions, highlight || ctx.selected) }
+                }
+                Box(
+                    Modifier.matchParentSize().clickable(
+                        onClickLabel = if (ctx.selected) "取消选中" else "选中", role = Role.Checkbox,
+                    ) { actions.onToggleSelect(m) },
+                )
+            }
+        } else MessageRowContent(m, isGroup, showSenderHeader, actions, highlight)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MessageRowContent(m: MessageItem, isGroup: Boolean, showSenderHeader: Boolean, actions: BubbleActions, highlight: Boolean) {
     when {
         m.deleted -> {
             val note = if (m.isOutgoing) "你撤回了一条消息" else "\"${rememberName(m.senderId, "对方")}\" 撤回了一条消息"
@@ -157,7 +206,7 @@ private fun Bubble(m: MessageItem, actions: BubbleActions) {
     val bg = if (out) Hush.colors.accent else Hush.colors.incomingBubble
     val fg = if (out) Hush.colors.onAccent else Hush.colors.textPrimary
     val body = m.body
-    val isImageOnly = body is MessageBody.Attachments && body.items.all { it.kind == AttachmentKind.IMAGE } && body.caption.isNullOrEmpty() && m.quote == null
+    val isImageOnly = body is MessageBody.Attachments && body.items.all { it.kind == AttachmentKind.IMAGE || it.kind == AttachmentKind.VIDEO } && body.caption.isNullOrEmpty() && m.quote == null
     Column(
         Modifier.clip(RoundedCornerShape(18.dp))
             .background(if (isImageOnly) Color.Transparent else bg)
@@ -194,7 +243,11 @@ private fun Bubble(m: MessageItem, actions: BubbleActions) {
                 if (isImageOnly) {
                     // 纯图片：时间与状态叠加在图片右下角
                     Box {
-                        Column { body.items.forEachIndexed { i, a -> ImageContent(m, a, i, actions, rounded = true) } }
+                        Column {
+                            body.items.forEachIndexed { i, a ->
+                                if (a.kind == AttachmentKind.VIDEO) VideoContent(m, a, i, actions, rounded = true) else ImageContent(m, a, i, actions, rounded = true)
+                            }
+                        }
                         Footer(m, fg, overlay = true, modifier = Modifier.align(Alignment.BottomEnd))
                     }
                 } else {
@@ -202,8 +255,9 @@ private fun Bubble(m: MessageItem, actions: BubbleActions) {
                     Column(Modifier.width(IntrinsicSize.Max)) {
                         body.items.forEachIndexed { i, a ->
                             when (a.kind) {
-                                AttachmentKind.IMAGE, AttachmentKind.VIDEO -> ImageContent(m, a, i, actions, rounded = false)
-                                AttachmentKind.VOICE -> VoiceContent(m, a, fg)
+                                AttachmentKind.IMAGE -> ImageContent(m, a, i, actions, rounded = false)
+                                AttachmentKind.VIDEO -> VideoContent(m, a, i, actions, rounded = false)
+                                AttachmentKind.VOICE -> VoiceContent(m, a, i, fg)
                                 AttachmentKind.FILE -> FileContent(m, a, i, fg, actions)
                             }
                         }
@@ -225,13 +279,22 @@ private fun Bubble(m: MessageItem, actions: BubbleActions) {
 private fun TextContent(text: String, m: MessageItem, fg: Color, modifier: Modifier = Modifier, mentions: List<Mention> = emptyList()) {
     // U4：@ 片段强调显示。发出的气泡底色就是强调色，改用加粗 + 下划线
     val accent = Hush.colors.accent
-    val styled = remember(text, mentions, m.isOutgoing, accent) {
+    val actions = LocalBubbleActions.current
+    val selecting = LocalRowContext.current.selecting
+    val styled = remember(text, mentions, m.isOutgoing, accent, actions, selecting) {
         val ranges = MentionEditor.highlightRanges(text, mentions)
-        if (ranges.isEmpty()) null else buildAnnotatedString {
+        val links = Links.find(text)
+        if (ranges.isEmpty() && links.isEmpty()) null else buildAnnotatedString {
             append(text)
             val style = if (m.isOutgoing) SpanStyle(fontWeight = FontWeight.SemiBold, textDecoration = TextDecoration.Underline)
             else SpanStyle(color = accent, fontWeight = FontWeight.Medium)
             ranges.forEach { addStyle(style, it.first, it.last + 1) }
+            // 链接（http / https）：下划线，点按打开（非 https 先确认）。多选模式下不响应，避免误触
+            val linkStyle = TextLinkStyles(SpanStyle(textDecoration = TextDecoration.Underline, color = if (m.isOutgoing) Color.Unspecified else accent))
+            links.forEach { l ->
+                if (selecting || actions == null) addStyle(linkStyle.style!!, l.start, l.end)
+                else addLink(LinkAnnotation.Clickable(l.url, linkStyle) { actions.onLinkClick(l.url) }, l.start, l.end)
+            }
         }
     }
     Column(modifier.padding(start = 12.dp, end = 12.dp, top = 7.dp, bottom = 5.dp)) {
@@ -285,35 +348,90 @@ private fun displaySize(a: AttachmentItem): Pair<Dp, Dp> {
     return dw.coerceAtLeast(90f).dp to dh.coerceAtLeast(90f).dp
 }
 
+/** 未下载的附件上的状态：下载中转圈；失败显示“重试”；没有自动下载的显示下载图标与大小（B10）。 */
+@Composable
+private fun DownloadOverlay(state: DownloadState?, size: Long, tint: Color, tag: String) {
+    when (state) {
+        DownloadState.LOADING -> CircularProgressIndicator(Modifier.size(28.dp).testTag("dl_loading_$tag"), color = tint, strokeWidth = 2.dp)
+        DownloadState.FAILED -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.testTag("dl_failed_$tag")) {
+            Icon(Icons.Filled.Refresh, "下载失败，点按重试", tint = tint, modifier = Modifier.size(28.dp))
+            Text("点按重试", style = HushType.timestamp, color = tint)
+        }
+        null -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.testTag("dl_idle_$tag")) {
+            Icon(Icons.Filled.Download, "点按下载", tint = tint, modifier = Modifier.size(28.dp))
+            if (size > 0) Text(MediaUtils.humanSize(size), style = HushType.timestamp, color = tint)
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ImageContent(m: MessageItem, a: AttachmentItem, index: Int, actions: BubbleActions, rounded: Boolean) {
     val (w, h) = displaySize(a)
     val local = rememberExistingPath(a.localPath)
     val thumb = remember(a.id, a.thumbnail) { a.thumbnail?.let { runCatching { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }.getOrNull() } }
+    val state = LocalRowContext.current.downloads[ChatViewModel.attKey(m.id, index)]
     Box(
         Modifier.padding(if (rounded) 0.dp else 4.dp).size(w, h).clip(RoundedCornerShape(if (rounded) 18.dp else 14.dp))
             .background(Hush.colors.surface)
+            // 已在本地：打开大图；否则：下载（失败后即“重试”），下载完成后打开
             .combinedClickable(onClick = { actions.onImageClick(m, index) }, onLongClick = { actions.onLongPress(m) })
             .testTag("image_${m.id}"),
         contentAlignment = Alignment.Center,
     ) {
-        when {
-            local != null -> AsyncImage(File(local), "图片", contentScale = ContentScale.Crop, modifier = Modifier.size(w, h))
-            thumb != null -> {
-                Image(thumb, "图片", contentScale = ContentScale.Crop, modifier = Modifier.size(w, h).blur(12.dp))
-                CircularProgressIndicator(Modifier.size(28.dp), color = Color.White, strokeWidth = 2.dp)
-            }
-            else -> CircularProgressIndicator(Modifier.size(28.dp), color = Hush.colors.accent, strokeWidth = 2.dp)
+        if (local != null) {
+            // Coil 带 GIF 解码器（B14）：动图直接播放
+            AsyncImage(File(local), "图片", contentScale = ContentScale.Crop, modifier = Modifier.size(w, h))
+        } else {
+            if (thumb != null) Image(thumb, "图片", contentScale = ContentScale.Crop, modifier = Modifier.size(w, h).blur(12.dp))
+            DownloadOverlay(state, a.size.toLong(), if (thumb != null) Color.White else Hush.colors.accent, m.id)
         }
     }
 }
 
+/** 视频附件（B14 兜底）：显示首帧缩略图、播放图标与时长，点按下载后交给系统播放器播放。 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun VoiceContent(m: MessageItem, a: AttachmentItem, fg: Color) {
+private fun VideoContent(m: MessageItem, a: AttachmentItem, index: Int, actions: BubbleActions, rounded: Boolean) {
+    val (w, h) = displaySize(a)
+    val local = rememberExistingPath(a.localPath)
+    val thumb = remember(a.id, a.thumbnail) { a.thumbnail?.let { runCatching { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }.getOrNull() } }
+    // 本地已有视频文件时取一张更清晰的首帧（IO 线程，带小缓存）
+    val frame by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, local) {
+        value = local?.let { VideoFrames.load(it) }
+    }
+    val state = LocalRowContext.current.downloads[ChatViewModel.attKey(m.id, index)]
+    Box(
+        Modifier.padding(if (rounded) 0.dp else 4.dp).size(w, h).clip(RoundedCornerShape(if (rounded) 18.dp else 14.dp))
+            .background(Color.Black)
+            .combinedClickable(onClick = { actions.onVideoClick(m, index) }, onLongClick = { actions.onLongPress(m) })
+            .testTag("video_${m.id}"),
+        contentAlignment = Alignment.Center,
+    ) {
+        (frame ?: thumb)?.let { Image(it, "视频", contentScale = ContentScale.Crop, modifier = Modifier.size(w, h)) }
+        if (state == DownloadState.LOADING || state == DownloadState.FAILED) DownloadOverlay(state, a.size.toLong(), Color.White, m.id)
+        else Box(Modifier.size(48.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
+            Icon(Icons.Filled.PlayArrow, "播放视频", tint = Color.White, modifier = Modifier.size(32.dp))
+        }
+        Text(
+            buildString {
+                if (a.durationMs > 0u) append(TimeFormat.duration((a.durationMs.toLong() + 500) / 1000))
+                if (local == null && a.size > 0u) { if (isNotEmpty()) append(" · "); append(MediaUtils.humanSize(a.size.toLong())) }
+            },
+            style = HushType.timestamp, color = Color.White,
+            modifier = Modifier.align(Alignment.BottomStart).padding(6.dp).clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.35f)).padding(horizontal = 6.dp, vertical = 1.dp),
+        )
+    }
+}
+
+@Composable
+private fun VoiceContent(m: MessageItem, a: AttachmentItem, index: Int, fg: Color) {
     val playing by VoicePlayer.state.collectAsState()
     val key = m.id + a.id
     val me = playing?.takeIf { it.key == key }
     val local = rememberExistingPath(a.localPath)
+    val state = LocalRowContext.current.downloads[ChatViewModel.attKey(m.id, index)]
+    val actions = LocalBubbleActions.current
     val secs = (a.durationMs.toLong() + 500) / 1000
     Row(
         Modifier.padding(start = 8.dp, end = 12.dp, top = 8.dp, bottom = 2.dp).width((110 + (secs.coerceAtMost(60) * 2)).toInt().dp),
@@ -321,12 +439,19 @@ private fun VoiceContent(m: MessageItem, a: AttachmentItem, fg: Color) {
     ) {
         Box(
             Modifier.size(34.dp).clip(CircleShape).background(fg.copy(alpha = 0.18f))
-                .clickable(enabled = local != null) { local?.let { VoicePlayer.toggle(key, it) } }
+                .clickable(enabled = local != null || state != DownloadState.LOADING) {
+                    if (local != null) VoicePlayer.toggle(key, local) else actions?.onRetryDownload(m, index)
+                }
                 .testTag("voice_${m.id}"),
             contentAlignment = Alignment.Center,
         ) {
-            if (local == null) CircularProgressIndicator(Modifier.size(18.dp), color = fg, strokeWidth = 2.dp)
-            else Icon(if (me != null) Icons.Filled.Pause else Icons.Filled.PlayArrow, if (me != null) "暂停" else "播放", tint = fg)
+            when {
+                local != null -> Icon(if (me != null) Icons.Filled.Pause else Icons.Filled.PlayArrow, if (me != null) "暂停" else "播放", tint = fg)
+                // B10：下载失败不再永久转圈，点按重试
+                state == DownloadState.FAILED -> Icon(Icons.Filled.Refresh, "下载失败，点按重试", tint = fg, modifier = Modifier.size(20.dp))
+                state == DownloadState.LOADING -> CircularProgressIndicator(Modifier.size(18.dp), color = fg, strokeWidth = 2.dp)
+                else -> Icon(Icons.Filled.Download, "点按下载", tint = fg, modifier = Modifier.size(20.dp))
+            }
         }
         Spacer(Modifier.width(8.dp))
         LinearProgressIndicator(
@@ -341,18 +466,26 @@ private fun VoiceContent(m: MessageItem, a: AttachmentItem, fg: Color) {
 
 @Composable
 private fun FileContent(m: MessageItem, a: AttachmentItem, index: Int, fg: Color, actions: BubbleActions) {
+    val state = LocalRowContext.current.downloads[ChatViewModel.attKey(m.id, index)]
     Row(
         Modifier.padding(start = 10.dp, end = 12.dp, top = 10.dp, bottom = 2.dp).widthIn(min = 180.dp)
             .clickable { actions.onFileClick(m, index) }.testTag("file_${m.id}"),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(Modifier.size(40.dp).clip(RoundedCornerShape(8.dp)).background(fg.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
-            Icon(Icons.AutoMirrored.Filled.InsertDriveFile, "文件", tint = fg)
+            when (state) {
+                DownloadState.LOADING -> CircularProgressIndicator(Modifier.size(20.dp), color = fg, strokeWidth = 2.dp)
+                DownloadState.FAILED -> Icon(Icons.Filled.Refresh, "下载失败，点按重试", tint = fg)
+                null -> Icon(Icons.AutoMirrored.Filled.InsertDriveFile, "文件", tint = fg)
+            }
         }
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f, fill = false)) {
             Text(a.fileName, style = HushType.body.copy(fontSize = HushType.secondary.fontSize * 1.1f), color = fg, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text(MediaUtils.humanSize(a.size.toLong()), style = HushType.timestamp, color = fg.copy(alpha = 0.7f))
+            Text(
+                if (state == DownloadState.FAILED) "下载失败，点按重试" else MediaUtils.humanSize(a.size.toLong()),
+                style = HushType.timestamp, color = fg.copy(alpha = 0.7f),
+            )
         }
     }
 }

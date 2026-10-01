@@ -156,7 +156,13 @@ impl Store {
     // ---------- conversations ----------
     /// 不存在则创建，返回是否新建。
     /// 被删除过的会话（K1）重新出现时沿用删除前的免打扰设置。
+    ///
+    /// A2：会话 id 必须是 `u:<非空>` / `g:<非空>`。旧版本处理 `from` 为空的信封时会建出 `u:` 这样的会话，
+    /// 之后整个会话列表都读不出来。
     pub fn ensure_conv(&self, conv_id: &str, expire_secs: u32) -> Result<bool> {
+        if !valid_conv_id(conv_id) {
+            return Err(HushError::invalid(format!("会话 id 无效: {conv_id}")));
+        }
         let c = self.conn();
         let hint = super::muted_hint_key(conv_id);
         let n = c.execute(
@@ -184,8 +190,12 @@ impl Store {
             draft: draft_blob.zip(draft_ts),
         })
     }
-    /// 会话行 + 未读提及数（K6，部分索引 messages_mentions）+ 草稿（K5）。
-    const CONV_SELECT: &'static str = "SELECT c.conv_id,c.last_ts,c.unread,c.pinned,c.muted,c.archived,c.expire_secs,
+    /// 会话行 + 未读数（A10：按消息表实时统计，部分索引 messages_unread；删除、撤回、阅后即焚后自然回落，
+    /// `conversations.unread` 列不再读取）+ 未读提及数（K6，部分索引 messages_mentions）+ 草稿（K5）。
+    const CONV_SELECT: &'static str = "SELECT c.conv_id,c.last_ts,
+          (SELECT COUNT(*) FROM messages u INDEXED BY messages_unread
+            WHERE u.conv_id=c.conv_id AND u.read=0 AND u.outgoing=0 AND u.deleted=0),
+          c.pinned,c.muted,c.archived,c.expire_secs,
           (SELECT COUNT(*) FROM messages m WHERE m.conv_id=c.conv_id AND m.mentions_me=1 AND m.read=0 AND m.deleted=0),
           d.text, d.updated_at
         FROM conversations c LEFT JOIN drafts d ON d.conv_id=c.conv_id";
@@ -223,17 +233,15 @@ impl Store {
             .execute("UPDATE conversations SET expire_secs=?2 WHERE conv_id=?1", params![conv_id, secs as i64])?;
         Ok(())
     }
-    /// 有新消息：更新时间，增加未读，取消归档（未免打扰时）。
+    /// 有新消息：更新时间，取消归档（`unread_inc>0` 且未免打扰时）。未读数本身按消息表实时统计（A10）。
+    /// 时间钳到当前时间附近（A6）：极端的服务端时间戳不能让会话永远置顶。
     pub fn bump_conv(&self, conv_id: &str, ts: i64, unread_inc: u32) -> Result<()> {
+        let ts = clamp_ts(ts);
         self.conn().execute(
             "UPDATE conversations SET last_ts=MAX(last_ts,?2), unread=unread+?3,
                archived=CASE WHEN ?3>0 AND muted=0 THEN 0 ELSE archived END WHERE conv_id=?1",
             params![conv_id, ts, unread_inc as i64],
         )?;
-        Ok(())
-    }
-    pub fn clear_unread(&self, conv_id: &str) -> Result<()> {
-        self.conn().execute("UPDATE conversations SET unread=0 WHERE conv_id=?1", [conv_id])?;
         Ok(())
     }
 }

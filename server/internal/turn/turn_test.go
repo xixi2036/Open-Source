@@ -1,7 +1,9 @@
 package turn
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"testing"
@@ -22,7 +24,7 @@ func TestCredentialsFormat(t *testing.T) {
 }
 
 func TestAuthHandler(t *testing.T) {
-	h := authHandler("s3cret")
+	h := authHandler(Config{Secret: "s3cret"})
 	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 
 	user, cred := Credentials("s3cret", "u", time.Hour, time.Now())
@@ -124,5 +126,59 @@ func TestRelayToLoopbackOnlyInDev(t *testing.T) {
 	}
 	if relayTo(t, false) {
 		t.Fatal("生产模式应拒绝中继到回环地址")
+	}
+}
+
+// B10：凭证与登录态绑定——用户失去登录态后，没过期的凭证也被拒绝；非法 username 不原样写进日志。
+func TestAuthBoundToLoginState(t *testing.T) {
+	loggedIn := map[string]bool{"alice": true}
+	h := authHandler(Config{Secret: "s3cret", Validate: func(uid string) bool { return loggedIn[uid] }})
+	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	alice, _ := Credentials("s3cret", "alice", time.Hour, time.Now())
+	if _, ok := h(alice, Realm, src); !ok {
+		t.Fatal("登录中的用户应通过")
+	}
+	loggedIn["alice"] = false
+	if _, ok := h(alice, Realm, src); ok {
+		t.Fatal("退出登录后凭证应立即失效")
+	}
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+	evil := "evil\n2026/01/01 [auth] 登录成功 user=admin"
+	if _, ok := h(evil, Realm, src); ok {
+		t.Fatal("非法 username 应被拒绝")
+	}
+	if strings.Contains(buf.String(), "登录成功") || strings.Contains(buf.String(), "evil") {
+		t.Fatalf("日志里不应出现 username 原文: %q", buf.String())
+	}
+}
+
+// B10：每用户中继分配数上限。
+func TestAllocationQuotaPerUser(t *testing.T) {
+	a := &allocations{max: 2, n: map[string]int{}}
+	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	u1, _ := Credentials("s", "u1", time.Hour, time.Now())
+	u1b, _ := Credentials("s", "u1", 2*time.Hour, time.Now()) // 同一用户的另一份凭证
+	u2, _ := Credentials("s", "u2", time.Hour, time.Now())
+	for i, name := range []string{u1, u1b} {
+		if !a.quota(name, Realm, src) {
+			t.Fatalf("第 %d 个分配应允许", i+1)
+		}
+		a.created(name)
+	}
+	if a.quota(u1, Realm, src) {
+		t.Fatal("同一用户（不论用哪份凭证）超过上限应拒绝")
+	}
+	if !a.quota(u2, Realm, src) {
+		t.Fatal("其他用户不受影响")
+	}
+	a.deleted(u1)
+	if !a.quota(u1b, Realm, src) {
+		t.Fatal("释放后应可再分配")
+	}
+	if a.quota("garbage", Realm, src) {
+		t.Fatal("非法 username 不给分配")
 	}
 }

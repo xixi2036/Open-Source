@@ -7,6 +7,14 @@ struct CallView: View {
     var core = HushCore.shared
 
     var body: some View {
+        if let block = calls.blocked {
+            CallBlockedView(block: block)
+        } else {
+            callBody
+        }
+    }
+
+    private var callBody: some View {
         ZStack {
             background
             if showRemoteVideo { scrims }
@@ -15,29 +23,36 @@ struct CallView: View {
                     Spacer().frame(height: 90)
                     UserAvatar(userId: calls.peerId, size: 110)
                         .shadow(radius: 10)
-                    Text(calls.peerName).font(.system(size: 28, weight: .semibold)).foregroundStyle(.white)
+                    Text(calls.peerName).font(Fonts.sized(28, weight: .semibold)).foregroundStyle(.white)
                         .padding(.top, 20)
                         .accessibilityIdentifier("callPeerName")
                 } else {
-                    Text(calls.peerName).font(.system(size: 20, weight: .semibold)).foregroundStyle(.white)
+                    Text(calls.peerName).font(Fonts.sized(20, weight: .semibold)).foregroundStyle(.white)
                         .legibleOnVideo().padding(.top, 60)
                         .accessibilityIdentifier("callPeerName")
                 }
                 statusText
-                    .font(.system(size: 17)).foregroundStyle(.white.opacity(0.9))
+                    .font(Fonts.sized(17)).foregroundStyle(.white.opacity(0.9))
                     .legibleOnVideo()
                     .padding(.top, 8)
                     .accessibilityIdentifier("callStatus")
+                if calls.reconnecting {
+                    Label("网络不稳定，正在重连…", systemImage: "wifi.exclamationmark")
+                        .font(Fonts.sized(15)).foregroundStyle(.white.opacity(0.9))
+                        .legibleOnVideo()
+                        .padding(.top, 14)
+                        .accessibilityIdentifier("callReconnecting")
+                }
                 if calls.interrupted {
                     Label("通话被系统打断，麦克风已暂停", systemImage: "pause.circle")
-                        .font(.system(size: 15)).foregroundStyle(.white.opacity(0.85))
+                        .font(Fonts.sized(15)).foregroundStyle(.white.opacity(0.85))
                         .legibleOnVideo()
                         .padding(.top, 14)
                         .accessibilityIdentifier("callInterrupted")
                 }
                 if calls.video && calls.phase == .active && !calls.remoteHasVideo {
                     Label("对方未开启摄像头", systemImage: "video.slash")
-                        .font(.system(size: 15)).foregroundStyle(.white.opacity(0.7))
+                        .font(Fonts.sized(15)).foregroundStyle(.white.opacity(0.7))
                         .padding(.top, 14)
                         .accessibilityIdentifier("remoteNoVideo")
                 }
@@ -53,6 +68,23 @@ struct CallView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                             .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.4)))
                             .padding(.trailing, 16).padding(.top, 60)
+                    }
+                    Spacer()
+                }
+            }
+            if calls.isLive && calls.phase != .incoming {
+                // 最小化：回到聊天继续操作，通话以悬浮条保留
+                VStack {
+                    HStack {
+                        Button { calls.minimized = true } label: {
+                            Image(systemName: "chevron.down").font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(.white).frame(width: 44, height: 44)
+                                .background(Circle().fill(Color.white.opacity(0.18)))
+                        }
+                        .accessibilityLabel("最小化通话")
+                        .accessibilityIdentifier("minimizeCall")
+                        .padding(.leading, 16).padding(.top, 56)
+                        Spacer()
                     }
                     Spacer()
                 }
@@ -87,14 +119,14 @@ struct CallView: View {
                 Color.black.opacity(0.55)
                 VStack(spacing: 6) {
                     Image(systemName: "video.slash.fill").font(.system(size: 22))
-                    Text("摄像头已关闭").font(.system(size: 12))
+                    Text("摄像头已关闭").font(Fonts.sized(12))
                 }.foregroundStyle(.white.opacity(0.8))
             }
         } else {
             RTCVideoView(track: track, mirror: calls.frontCamera && !calls.syntheticCamera)
                 .overlay(alignment: .bottom) {
                     if calls.syntheticCamera {
-                        Text("模拟摄像头").font(.system(size: 11, weight: .medium)).foregroundStyle(.white)
+                        Text("模拟摄像头").font(Fonts.sized(11, weight: .medium)).foregroundStyle(.white)
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(Capsule().fill(.black.opacity(0.45)))
                             .padding(.bottom, 6)
@@ -172,11 +204,81 @@ struct CallButton: View {
                     .foregroundStyle(fg)
                     .frame(width: 68, height: 68)
                     .background(Circle().fill(color))
-                Text(label).font(.system(size: 13)).foregroundStyle(.white)
+                Text(label).font(Fonts.sized(13)).foregroundStyle(.white)
                     .legibleOnVideo()
             }
         }
         .accessibilityIdentifier(id)
+    }
+}
+
+/// 通话最小化后的悬浮条（顶层窗口缩到这么大）：点击回到通话页
+struct CallPill: View {
+    var calls = CallManager.shared
+
+    var body: some View {
+        Button { calls.minimized = false } label: {
+            HStack(spacing: 6) {
+                Image(systemName: calls.video ? "video.fill" : "phone.fill").font(.system(size: 14, weight: .semibold))
+                label.font(.system(size: 14, weight: .semibold)).monospacedDigit().lineLimit(1)
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Capsule().fill(Theme.success))
+        }
+        .buttonStyle(.plain)
+        .ignoresSafeArea()
+        .accessibilityLabel("返回通话")
+        .accessibilityIdentifier("callPill")
+    }
+
+    @ViewBuilder private var label: some View {
+        switch calls.phase {
+        case .active:
+            if calls.reconnecting { Text("正在重连…") } else {
+                TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                    Text("通话中 " + Fmt.duration(Int(ctx.date.timeIntervalSince(calls.connectedAt ?? ctx.date))))
+                }
+            }
+        case .outgoing: Text("正在呼叫…")
+        case .connecting: Text("正在连接…")
+        case let .ended(reason): Text(reason)
+        default: Text("通话")
+        }
+    }
+}
+
+/// A4：麦克风 / 摄像头权限被拒绝，通话已中止——说明原因并引导去系统设置
+struct CallBlockedView: View {
+    let block: CallBlock
+    var calls = CallManager.shared
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(rgb: 0x1B2B4B), Color(rgb: 0x0E1422)], startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+            VStack(spacing: 18) {
+                Spacer()
+                Image(systemName: block == .microphone ? "mic.slash.fill" : "video.slash.fill")
+                    .font(.system(size: 52)).foregroundStyle(.white)
+                Text(block.title).font(Fonts.sized(24, weight: .semibold)).foregroundStyle(.white)
+                    .accessibilityIdentifier("callBlockedTitle")
+                Text(block.message).font(Fonts.sized(16)).foregroundStyle(.white.opacity(0.85))
+                    .multilineTextAlignment(.center).padding(.horizontal, 36)
+                Spacer()
+                Button("去设置") {
+                    calls.blocked = nil
+                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                }
+                .buttonStyle(PrimaryButtonStyle())
+                .accessibilityIdentifier("callOpenSettings")
+                Button("关闭") { calls.blocked = nil }
+                    .foregroundStyle(.white.opacity(0.9))
+                    .frame(minHeight: 44)
+                    .accessibilityIdentifier("callBlockedClose")
+            }
+            .padding(.horizontal, 32).padding(.bottom, 48)
+        }
     }
 }
 

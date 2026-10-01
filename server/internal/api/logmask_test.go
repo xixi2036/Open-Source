@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"hush/server/internal/logx"
 	"io"
 	"log"
 	"strings"
@@ -53,6 +54,8 @@ func TestLogsMaskAttachmentID(t *testing.T) {
 	var buf lockedBuf
 	log.SetOutput(&buf)
 	defer log.SetOutput(io.Discard)
+	logx.SetLevel(logx.Debug) // 请求日志是 debug 级
+	defer logx.SetLevel(logx.Info)
 
 	e := newEnv(t, true)
 	a := e.register("a")

@@ -1,5 +1,6 @@
 package com.hush.app.ui.contacts
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.hush.app.util.net
 
 import android.widget.Toast
@@ -68,7 +69,7 @@ fun ProfileScreen(
     val friends by ContactsStore.friends.collectAsState()
     val isFriend = friends.any { it.id == userId }
     val isMe = userId == HushCore.myId
-    var addDialog by remember { mutableStateOf(false) }
+    var addDialog by rememberSaveable { mutableStateOf(false) }
     var sent by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     // 扫到的二维码可能来自其他服务器或已注销的账号：资料拉取返回 404 时提示“用户不存在”，不显示“添加到通讯录”
@@ -122,7 +123,7 @@ fun ProfileScreen(
     }
     if (addDialog) {
         val myName = HushCore.account.collectAsState().value?.profile?.name ?: ""
-        var msg by remember { mutableStateOf("我是$myName") }
+        var msg by rememberSaveable { mutableStateOf("我是$myName") }
         AlertDialog(
             onDismissRequest = { addDialog = false },
             title = { Text("发送好友申请") },

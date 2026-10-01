@@ -167,9 +167,12 @@ enum MentionText {
         for seg in segments(text, mentions) {
             var a = AttributedString(seg.text)
             if seg.userId != nil {
-                a.foregroundColor = color
-                a.font = Fonts.body.weight(.semibold)
-                if underline { a.underlineStyle = .single }
+                // B12：用属性容器而不是 AttributedString 的动态成员写法（后者在 Swift 6 下因 key path 不是 Sendable 报错）
+                var c = AttributeContainer()
+                c[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = color
+                c[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = Fonts.body.weight(.semibold)
+                if underline { c[AttributeScopes.SwiftUIAttributes.UnderlineStyleAttribute.self] = .single }
+                a.mergeAttributes(c)
             }
             result += a
         }

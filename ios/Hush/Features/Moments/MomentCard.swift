@@ -16,7 +16,7 @@ struct MomentCard: View {
                 .onTapGesture { Router.shared.push(.profile(moment.author.id)) }
             VStack(alignment: .leading, spacing: 8) {
                 Text(moment.author.name)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(Fonts.sized(16, weight: .semibold))
                     .foregroundStyle(Theme.accent)
                     .onTapGesture { Router.shared.push(.profile(moment.author.id)) }
                 if !moment.text.isEmpty {
@@ -68,7 +68,8 @@ struct MomentCard: View {
                             .frame(width: 32, height: 22)
                             .background(RoundedRectangle(cornerRadius: 4).fill(Theme.surface))
                     }
-                    .accessibilityIdentifier("momentActions_\(moment.author.name)")
+                    .accessibilityLabel("赞或评论")
+                        .accessibilityIdentifier("momentActions_\(moment.author.name)")
                 }
                 if !moment.likes.isEmpty || !moment.comments.isEmpty {
                     interactions
@@ -91,7 +92,7 @@ struct MomentCard: View {
                 HStack(alignment: .top, spacing: 4) {
                     Image(systemName: "heart").font(.system(size: 12)).foregroundStyle(Theme.accent).padding(.top, 3)
                     Text(moment.likes.map(\.name).joined(separator: "，"))
-                        .font(.system(size: 14, weight: .medium)).foregroundStyle(Theme.accent)
+                        .font(Fonts.sized(14, weight: .medium)).foregroundStyle(Theme.accent)
                 }
                 .accessibilityIdentifier("likesLine")
             }
@@ -114,13 +115,13 @@ struct MomentCard: View {
 
     /// 「A 回复 B：内容」：用 Text 拼接着色（不用 AttributedString 的动态键路径，避免并发检查告警）
     private func commentLine(_ c: Comment) -> some View {
-        let nameFont = Font.system(size: 14, weight: .medium)
+        let nameFont = Fonts.sized(14, weight: .medium)
         var t = Text(c.author.name).font(nameFont).foregroundStyle(Theme.accent)
         if let r = c.replyTo {
             t = t + Text(" 回复 ").foregroundStyle(Theme.textPrimary) + Text(r.name).font(nameFont).foregroundStyle(Theme.accent)
         }
         t = t + Text("：\(c.text)").foregroundStyle(Theme.textPrimary)
-        return t.font(.system(size: 14)).fixedSize(horizontal: false, vertical: true)
+        return t.font(Fonts.sized(14)).fixedSize(horizontal: false, vertical: true)
             .accessibilityIdentifier("comment")
     }
 }

@@ -40,11 +40,24 @@ enum Theme {
     }
 }
 
+/// 字体。A5：全部跟随系统字号（动态字体）。
+/// 设计稿里的固定字号映射到最接近的文本样式（默认字号下大小不变）：20→title3，16→callout，13→footnote，11→caption2；
+/// 其他零散字号用 sized(_:) 按当前字号设置等比缩放。
 enum Fonts {
-    static let title = Font.system(size: 20, weight: .semibold)
-    static let body = Font.system(size: 16)
-    static let secondary = Font.system(size: 13)
-    static let timestamp = Font.system(size: 11)
+    static let title = Font.system(.title3, design: .default, weight: .semibold)
+    static let body = Font.system(.callout)
+    static let secondary = Font.system(.footnote)
+    static let timestamp = Font.system(.caption2)
+
+    /// 以默认字号下的 size 为基准、随动态字体缩放的系统字体（文字用；固定尺寸容器里的图标不要用）
+    static func sized(_ size: CGFloat, weight: Font.Weight = .regular, design: Font.Design = .default) -> Font {
+        Font.system(size: scaled(size), weight: weight, design: design)
+    }
+
+    /// 按正文样式的缩放比例放大数值（上限 maxScale，避免无障碍最大字号下把布局撑破）
+    static func scaled(_ value: CGFloat, maxScale: CGFloat = 2.4) -> CGFloat {
+        min(UIFontMetrics(forTextStyle: .body).scaledValue(for: value), value * maxScale)
+    }
 }
 
 extension UIColor {

@@ -7,7 +7,20 @@ import UniformTypeIdentifiers
 @MainActor @Observable
 final class ChatModel {
     let convId: String
-    var messages: [MessageItem] = []
+    var messages: [MessageItem] = [] {
+        didSet { dayStarts = DayBreaker.dayStartIds(messages) }
+    }
+    /// C2：每天第一条消息的 id（显示日期分隔）。只在消息列表变化时重算一次，视图刷新时直接查表
+    private(set) var dayStarts: Set<String> = []
+    /// 进入会话时的第一条未读消息：在它上方显示「以下为新消息」，并定位到这里
+    var firstUnreadId: String?
+    /// 进入会话时未读范围内第一条 @我 的消息（显示「有人@我」，点击跳转）
+    var mentionJumpId: String?
+    /// 多选模式与已选中的消息
+    var selecting = false
+    var selected: Set<String> = []
+    /// 恢复草稿后，输入框第一次获得焦点时把光标放到末尾（C1）
+    var cursorToEndOnFocus = false
     var hasMore = true
     var loadingOlder = false
     var quoting: MessageItem?
@@ -28,6 +41,17 @@ final class ChatModel {
     var pendingCursor: Int?
     /// 长按菜单里点了「转发」：菜单收起后由聊天页弹出会话选择
     @ObservationIgnored var pendingForward: MessageItem?
+    /// 长按菜单里点了「选择文字」：菜单收起后弹出可选择文字的面板
+    @ObservationIgnored var pendingSelectText: MessageItem?
+    /// 正在后台重新读取已加载范围（B9）；期间到达的事件在读取结果应用后重放
+    @ObservationIgnored private var refreshing = false
+    @ObservationIgnored private var eventsDuringRefresh: [CoreEvent] = []
+    @ObservationIgnored private var didInitialLoad = false
+    @ObservationIgnored private var resyncScheduled = false
+    /// 已经为它调用过 mark_read 的最新一条消息（核心不再为已读逐条发 MessageUpdated，不能靠消息状态判断）
+    @ObservationIgnored private var lastMarkedReadId: String?
+    /// 用户删除了还在发送中的附件消息：对应的 sendAttachment 会以 InvalidInput 结束，不提示
+    @ObservationIgnored private var cancelledSends = 0
     @ObservationIgnored private var draftRestored = false
     /// 刚恢复的草稿文本：它引起的文本变化不发送「正在输入」
     @ObservationIgnored private var restoredText: String?
@@ -61,8 +85,9 @@ final class ChatModel {
         core.activeConvId = convId
         if token == nil {
             token = core.subscribe { [weak self] ev in self?.handle(ev) }
-            // 从设置页等返回：保留已加载的历史与滚动位置，只合并最新一页
-            if messages.isEmpty { reload() } else { mergeLatest() }
+            // 从设置页等返回：保留已加载的历史与滚动位置，并把整个已加载范围与数据库对齐
+            //（B9：离开期间更早的消息可能被撤回、到期删除、状态变化，只合并最新一页会漏掉）
+            if messages.isEmpty { initialLoad() } else { refreshLoadedRange() }
             restoreDraft()
         }
         markRead()
@@ -86,6 +111,9 @@ final class ChatModel {
         composer.reset(d)
         restoredText = d
         draft = d
+        // C1：光标放在草稿末尾（否则第一次点输入框时光标落在点击处，位置不稳定）
+        pendingCursor = d.utf16.count
+        cursorToEndOnFocus = true
     }
 
     /// 离开聊天页 / App 进入后台时保存；空白则清除
@@ -184,7 +212,114 @@ final class ChatModel {
         let list = loadPage(nil, pageSize) ?? []
         messages = list
         hasMore = list.count >= Int(pageSize)
+        core.chats.noteFailed(list)
         bottomTick += 1
+    }
+
+    /// 首次进入会话：加载最新一页；有未读时再向上补页直到包含全部未读，
+    /// 记下第一条未读（显示「以下为新消息」并定位到它）和未读里第一条 @我 的消息。
+    /// 必须在第一次 markRead 之前调用（之后未读数就清零了）。
+    func initialLoad() {
+        let summary = core.chats.summary(convId)
+        let unread = Int(summary?.unreadCount ?? 0)
+        let mentions = Int(summary?.unreadMentions ?? 0)
+        var list = loadPage(nil, pageSize) ?? []
+        var more = list.count >= Int(pageSize)
+        // 未读多于已加载的：继续向上读（最多 maxUnreadPages 页，再多就定位到已加载的最早一条）
+        var pages = 1
+        while unread > 0, more, pages < Self.maxUnreadPages,
+              Self.firstUnreadIndex(list, unread: unread) == nil, let first = list.first {
+            let older = loadPage(first.sortTs, pageSize) ?? []
+            let existing = Set(list.map(\.id))
+            list.insert(contentsOf: older.filter { !existing.contains($0.id) }, at: 0)
+            more = older.count >= Int(pageSize)
+            pages += 1
+        }
+        messages = list
+        hasMore = more
+        core.chats.noteFailed(list)
+        didInitialLoad = true
+        if unread > 0, !list.isEmpty {
+            let idx = Self.firstUnreadIndex(list, unread: unread) ?? 0
+            firstUnreadId = list[idx].id
+            // 先按「不在底部」处理：聊天页定位完成后按实际位置判定，看到最新一条才标记已读
+            atBottom = false
+            if mentions > 0 {
+                mentionJumpId = list[idx...].first { MentionText.mentions($0, user: core.myId) }?.id
+            }
+            // 未读都在一屏之内时定位到分隔条与停在底部是同一个位置，由聊天页根据实际布局决定
+        }
+        bottomTick += 1
+    }
+
+    static let maxUnreadPages = 8
+
+    /// 会被核心计入未读数的消息：别人发来的正文、附件、无法解密的消息和通话记录
+    nonisolated static func countsAsUnread(_ m: MessageItem) -> Bool {
+        guard !m.isOutgoing else { return false }
+        switch m.body {
+        case .text, .attachments, .undecryptable: return true
+        case let .callLog(_, _, _, outgoing, _): return !outgoing
+        case .system: return false
+        }
+    }
+
+    /// 第一条未读消息的下标：从最新往回数第 unread 条计入未读的消息；已加载的不够数时返回 nil
+    nonisolated static func firstUnreadIndex(_ list: [MessageItem], unread: Int) -> Int? {
+        guard unread > 0 else { return nil }
+        var left = unread
+        for i in list.indices.reversed() where countsAsUnread(list[i]) {
+            left -= 1
+            if left == 0 { return i }
+        }
+        return nil
+    }
+
+    /// B9：把已加载的整个范围（最早一条到最新）重新从数据库读一遍并替换。
+    /// 逐页读取在后台线程进行；期间收到的事件先照常应用，读取结果替换后再重放一遍，避免用旧快照覆盖新状态。
+    func refreshLoadedRange() {
+        guard !refreshing, let first = messages.first else { mergeLatest(); return }
+        // 只有一页：同步合并即可
+        if messages.count <= Int(pageSize) { mergeLatest(); return }
+        refreshing = true
+        eventsDuringRefresh = []
+        let pager = backgroundPager()
+        let size = pageSize
+        let oldest = first.sortTs
+        let maxPages = messages.count / Int(size) + 3
+        Task { [weak self] in
+            let loaded = await Task.detached(priority: .userInitiated) {
+                Self.loadRange(downTo: oldest, pager: pager, pageSize: size, maxPages: maxPages)
+            }.value
+            guard let self else { return }
+            self.refreshing = false
+            let replay = self.eventsDuringRefresh
+            self.eventsDuringRefresh = []
+            guard let loaded, self.token != nil else { return }
+            let beforeLast = self.messages.last?.id
+            if loaded != self.messages { self.messages = loaded }
+            self.core.chats.noteFailed(loaded)
+            for ev in replay { self.handle(ev) }
+            if let last = self.messages.last?.id, last != beforeLast, self.atBottom { self.bottomTick += 1 }
+        }
+    }
+
+    /// 从最新一页向上读到 sortTs <= oldest 为止，返回 sortTs >= oldest 的全部消息（升序）。读取失败返回 nil。
+    nonisolated static func loadRange(downTo oldest: Int64, pager: (Int64?, UInt32) -> [MessageItem]?,
+                                     pageSize: UInt32, maxPages: Int) -> [MessageItem]? {
+        var out: [MessageItem] = []
+        var seen = Set<String>()
+        var cursor: Int64?
+        for _ in 0..<max(maxPages, 1) {
+            guard let page = pager(cursor, pageSize) else { return nil }
+            let fresh = page.filter { !seen.contains($0.id) }
+            for m in fresh { seen.insert(m.id) }
+            out.insert(contentsOf: fresh, at: 0)
+            guard let first = page.first, page.count >= Int(pageSize), first.sortTs > oldest,
+                  cursor.map({ first.sortTs < $0 }) ?? true else { break }
+            cursor = first.sortTs
+        }
+        return out.filter { $0.sortTs >= oldest }
     }
 
     /// 返回聊天页时合并最新一页：更新 / 插入新消息，删除窗口内已不存在的消息，不改动更早的已加载页
@@ -204,9 +339,35 @@ final class ChatModel {
         if appended > 0 { noteNewMessages(appended, outgoing: false) }
     }
 
+    /// 已确认出现在屏幕内的最新一条消息（由聊天页按实际滚动位置确认）。
+    /// 「停在底部」只是跟随的意图；已读、未读计数以这里为准。
+    @ObservationIgnored private(set) var lastSeenId: String?
+
     func setAtBottom(_ v: Bool) {
-        atBottom = v
-        if v { unseenCount = 0 }
+        let changed = atBottom != v
+        if changed { atBottom = v }
+        if v {
+            confirmLatestVisible()
+        } else if changed {
+            // 离开底部：在确认看到之后才到的消息都算没看到（用户正好在消息连续到达时滚走的情况）
+            let n = Self.unseenCount(messages, after: lastSeenId)
+            if unseenCount != n { unseenCount = n }
+        }
+    }
+
+    /// 最新一条消息确实在屏幕内：清零「n 条新消息」，现在才标记已读（A3：停在历史位置时新消息不算已读）
+    func confirmLatestVisible() {
+        if unseenCount != 0 { unseenCount = 0 }
+        let last = messages.last?.id
+        guard lastSeenId != last else { return }
+        lastSeenId = last
+        markRead()
+    }
+
+    /// lastSeen 之后别人发来的消息数（lastSeen 不在列表里时为 0）
+    nonisolated static func unseenCount(_ list: [MessageItem], after lastSeen: String?) -> Int {
+        guard let lastSeen, let i = list.lastIndex(where: { $0.id == lastSeen }) else { return 0 }
+        return list[(i + 1)...].filter { !$0.isOutgoing }.count
     }
 
     private func noteNewMessages(_ n: Int, outgoing: Bool) {
@@ -214,12 +375,11 @@ final class ChatModel {
     }
 
     /// 相邻两条消息是否跨天（按排序时间），与 messages 一一对应
-    var dayBreaks: [Bool] { Self.dayBreaks(messages) }
+    var dayBreaks: [Bool] { messages.map { dayStarts.contains($0.id) } }
 
     static func dayBreaks(_ list: [MessageItem]) -> [Bool] {
-        list.indices.map { i in
-            i == 0 || !Fmt.cal.isDate(Fmt.date(list[i].sortTs), inSameDayAs: Fmt.date(list[i - 1].sortTs))
-        }
+        let starts = DayBreaker.dayStartIds(list)
+        return list.map { starts.contains($0.id) }
     }
 
     func loadOlder() {
@@ -231,29 +391,54 @@ final class ChatModel {
         let fresh = older.filter { !existing.contains($0.id) }
         messages.insert(contentsOf: fresh, at: 0)
         hasMore = older.count >= Int(pageSize)
+        core.chats.noteFailed(fresh)
         loadingOlder = false
     }
 
     func handle(_ ev: CoreEvent) {
+        if refreshing { eventsDuringRefresh.append(ev) }
         switch ev {
         case let .messageAdded(cid, m, _, _) where cid == convId:
             // 离线补拉的旧消息插在中间：不滚动、不计入新消息
             if upsert(m, appendIfMissing: true) { noteNewMessages(1, outgoing: m.isOutgoing) }
+            // 只有停在底部（新消息确实可见）时才标记已读并发回执
             if !m.isOutgoing { markRead() }
         case let .messageUpdated(cid, m) where cid == convId:
             upsert(m, appendIfMissing: false)
         case let .messageRemoved(cid, id) where cid == convId:
             withAnimation(.easeOut(duration: 0.35)) { messages.removeAll { $0.id == id } }
+            selected.remove(id)
         case .conversationsChanged:
-            // 清空聊天记录等批量变化
+            // 清空聊天记录等批量变化：立即处理
             if messages.isEmpty == false,
                (loadPage(nil, 1) ?? []).isEmpty {
                 messages = []
                 unseenCount = 0
+            } else {
+                // 核心在事件积压过多时会丢弃逐条的消息事件、只补一个 ConversationsChanged；
+                // 撤回 / 到期 / 已读等批量变化也可能只有这一个事件：稍后把当前页与数据库对齐一次
+                scheduleResync()
             }
         default: break
         }
     }
+
+    /// 收到 ConversationsChanged 后对齐当前页（合并 1 秒内的多次触发）。
+    /// 已加载不多时对齐整个已加载范围；加载了很长的历史时只对齐最新一页（整段重读太重，离开再回来时会做）。
+    private func scheduleResync() {
+        guard token != nil, !resyncScheduled else { return }
+        resyncScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.resyncScheduled = false
+                guard self.token != nil, !self.messages.isEmpty, !self.locating else { return }
+                if self.messages.count <= Self.fullResyncLimit { self.refreshLoadedRange() } else { self.mergeLatest() }
+            }
+        }
+    }
+
+    static let fullResyncLimit = 240
 
     /// 更新或插入；返回是否作为最新一条追加到末尾
     @discardableResult
@@ -282,7 +467,7 @@ final class ChatModel {
 
     /// 标记已读（合并 0.3 秒内的多次调用，积压消息同步时只发一次）
     func markRead() {
-        guard visible, core.appActive else { return }
+        guard visible, core.appActive, atBottom else { return }
         markReadWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated { self?.markReadNow() }
@@ -292,10 +477,13 @@ final class ChatModel {
     }
 
     private func markReadNow() {
-        guard visible, core.appActive else { return }
+        // 只有最新一条已确认可见时才标记（核心的 mark_read 会把整个会话标为已读）
+        guard visible, core.appActive, atBottom, lastSeenId == messages.last?.id else { return }
+        let last = messages.last?.id
         let hasUnread = (core.chats.summary(convId)?.unreadCount ?? 0) > 0
-            || messages.contains { !$0.isOutgoing && $0.status != .read && isVisibleContent($0) }
+            || (last != lastMarkedReadId && messages.contains { !$0.isOutgoing && $0.status != .read && isVisibleContent($0) })
         guard hasUnread else { return }
+        lastMarkedReadId = last
         core.chats.markRead(convId)
     }
 
@@ -324,10 +512,43 @@ final class ChatModel {
         core.run { try await chats.sendText(cid, text: text, quoteId: quoteId, mentions: mentions) }
     }
 
-    func sendImage(url: URL, width: Int, height: Int) {
+    /// thumbnail 由调用方在后台线程生成（C4）
+    func sendImage(url: URL, width: Int, height: Int, thumbnail: Data?) {
         let meta = AttachmentMeta(fileName: url.lastPathComponent, width: UInt32(width), height: UInt32(height),
-                                  durationMs: 0, thumbnail: ImageUtil.thumbnail(url))
+                                  durationMs: 0, thumbnail: thumbnail)
         send(path: url.path, mime: "image/jpeg", kind: .image, meta: meta)
+    }
+
+    func sendVideo(_ v: PreparedVideo) {
+        let meta = AttachmentMeta(fileName: v.url.lastPathComponent, width: UInt32(v.width), height: UInt32(v.height),
+                                  durationMs: v.durationMs, thumbnail: v.thumbnail)
+        send(path: v.url.path, mime: v.mime, kind: .video, meta: meta)
+    }
+
+    /// 依次发送相册里选中的多项（图片 / 视频）：逐条等待上一条发完再发下一条，保持选择顺序
+    func sendMedia(_ items: [PreparedMedia]) {
+        let cid = convId
+        let chats = core.chats
+        Task {
+            for item in items {
+                let path: String, mime: String, kind: AttachmentKind, meta: AttachmentMeta
+                switch item {
+                case let .image(url, w, h, thumb):
+                    path = url.path; mime = "image/jpeg"; kind = .image
+                    meta = AttachmentMeta(fileName: url.lastPathComponent, width: UInt32(w), height: UInt32(h), durationMs: 0, thumbnail: thumb)
+                case let .video(v):
+                    path = v.url.path; mime = v.mime; kind = .video
+                    meta = AttachmentMeta(fileName: v.url.lastPathComponent, width: UInt32(v.width), height: UInt32(v.height),
+                                          durationMs: v.durationMs, thumbnail: v.thumbnail)
+                }
+                do {
+                    try await chats.sendAttachment(cid, path: path, mime: mime, kind: kind, meta: meta)
+                } catch {
+                    if !consumeCancelledSend(error) { core.toast = describe(error) }
+                }
+                AppPaths.discardOutbox(path)
+            }
+        }
     }
 
     func sendVoice(url: URL, durationMs: UInt64) {
@@ -343,10 +564,14 @@ final class ChatModel {
     private func send(path: String, mime: String, kind: AttachmentKind, meta: AttachmentMeta) {
         let cid = convId
         let chats = core.chats
-        core.run {
+        Task {
             // 核心读入后会在自己的目录保存副本（失败重发也用那份），outbox 里的明文临时文件随即删除
             defer { AppPaths.discardOutbox(path) }
-            try await chats.sendAttachment(cid, path: path, mime: mime, kind: kind, meta: meta)
+            do {
+                try await chats.sendAttachment(cid, path: path, mime: mime, kind: kind, meta: meta)
+            } catch {
+                if !consumeCancelledSend(error) { core.toast = describe(error) }
+            }
         }
     }
 
@@ -367,11 +592,74 @@ final class ChatModel {
         core.run { try await chats.recall(id) }
     }
 
+    /// 发送中的附件被用户删除（取消发送）后，核心让对应的 sendAttachment 以 InvalidInput 结束：这不是错误，不提示
+    private func consumeCancelledSend(_ error: Error) -> Bool {
+        guard cancelledSends > 0, case HushError.InvalidInput = error else { return false }
+        cancelledSends -= 1
+        return true
+    }
+
+    private func noteCancelIfSending(_ m: MessageItem) {
+        if m.isOutgoing, m.status == .sending, case .attachments = m.body { cancelledSends += 1 }
+    }
+
     func deleteLocal(_ m: MessageItem) {
         do {
             try core.chats.deleteLocal(m.id)
+            noteCancelIfSending(m)
             withAnimation { messages.removeAll { $0.id == m.id } }
         } catch { core.toast = describe(error) }
+    }
+
+    // MARK: - 多选
+
+    /// 可以被选中的消息：气泡消息（文字、附件、无法解密）
+    nonisolated static func selectable(_ m: MessageItem) -> Bool {
+        switch m.body {
+        case .text, .attachments, .undecryptable: return true
+        default: return false
+        }
+    }
+
+    /// 可以转发：未撤回的文字，或已上传的附件（发送中 / 失败的附件还没有服务端密文）
+    nonisolated static func forwardable(_ m: MessageItem) -> Bool {
+        guard !m.deleted else { return false }
+        switch m.body {
+        case .text: return true
+        case .attachments: return !(m.isOutgoing && (m.status == .sending || m.status == .failed))
+        default: return false
+        }
+    }
+
+    func beginSelecting(_ m: MessageItem) {
+        selecting = true
+        selected = Self.selectable(m) ? [m.id] : []
+    }
+
+    func toggleSelected(_ m: MessageItem) {
+        guard Self.selectable(m) else { return }
+        if selected.contains(m.id) { selected.remove(m.id) } else { selected.insert(m.id) }
+    }
+
+    func endSelecting() {
+        selecting = false
+        selected = []
+    }
+
+    /// 已选中的消息，按时间顺序
+    var selectedMessages: [MessageItem] { messages.filter { selected.contains($0.id) } }
+
+    /// 批量删除（仅本机）
+    func deleteSelected() {
+        let targets = selectedMessages
+        var failed = 0
+        for m in targets {
+            do { try core.chats.deleteLocal(m.id); noteCancelIfSending(m) } catch { failed += 1 }
+        }
+        let ids = Set(targets.map(\.id))
+        withAnimation { messages.removeAll { ids.contains($0.id) } }
+        endSelecting()
+        core.toast = failed == 0 ? "已删除 \(targets.count) 条消息" : "有 \(failed) 条消息删除失败"
     }
 
     func canRecall(_ m: MessageItem) -> Bool {

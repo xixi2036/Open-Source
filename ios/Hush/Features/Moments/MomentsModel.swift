@@ -45,6 +45,21 @@ final class MomentsModel {
         }
     }
 
+    @ObservationIgnored private var lastAutoRefresh = Date.distantPast
+
+    /// 进入朋友圈 Tab 时是否需要自动刷新：距上次自动刷新超过 minInterval 秒
+    nonisolated static func shouldAutoRefresh(last: Date, now: Date, minInterval: TimeInterval) -> Bool {
+        now.timeIntervalSince(last) >= minInterval
+    }
+
+    /// 进入朋友圈 Tab 时自动刷新：首次直接加载；之后合并最新一页（不打断阅读位置、不丢已加载的后续页），
+    /// 失败时不弹提示。短时间内来回切换 Tab 不重复请求。
+    func autoRefresh(now: Date = Date(), minInterval: TimeInterval = 15) async {
+        guard Self.shouldAutoRefresh(last: lastAutoRefresh, now: now, minInterval: minInterval) else { return }
+        lastAutoRefresh = now
+        if loaded { await mergeLatest() } else { await refresh() }
+    }
+
     func refresh() async {
         guard !loading else { return }
         loading = true

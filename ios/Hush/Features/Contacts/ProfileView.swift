@@ -122,7 +122,7 @@ struct AddFriendView: View {
                         HStack(spacing: 12) {
                             AvatarView(seed: r.id, name: r.name, avatarId: r.avatarId, size: 48)
                             VStack(alignment: .leading) {
-                                Text(r.name).font(.system(size: 17, weight: .medium))
+                                Text(r.name).font(Fonts.sized(17, weight: .medium))
                                 Text(core.contacts.isFriend(r.id) ? "已是好友" : (r.about.isEmpty ? "点击查看资料" : r.about))
                                     .font(Fonts.secondary).foregroundStyle(Theme.textSecondary).lineLimit(1)
                             }

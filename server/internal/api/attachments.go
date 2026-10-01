@@ -2,8 +2,8 @@ package api
 
 import (
 	"errors"
+	"hush/server/internal/logx"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +19,15 @@ const MaxAttachmentSize = 100 << 20
 
 // POST /v1/attachments（原始字节）→ {id, size}
 func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request, uid string) {
+	// 上传并发单独限流：上传耗时长、占磁盘 I/O，不能让它们把服务端占满
+	select {
+	case s.uploads2 <- struct{}{}:
+		defer func() { <-s.uploads2 }()
+	default:
+		s.metrics.Add("overload_rejected", 1)
+		overloaded(w)
+		return
+	}
 	limit := s.cfg.MaxAttachmentBytes
 	if r.ContentLength > limit {
 		fail(w, codeTooLarge, "附件不能超过 100MB")
@@ -83,7 +92,7 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request, 
 		internalErr(w, r, err)
 		return
 	}
-	log.Printf("[attach] user=%s 上传 %s（%d 字节）", uid, maskID(id), size)
+	logx.Debugf("[attach] user=%s 上传 %s（%d 字节）", uid, maskID(id), size)
 	ok(w, obj{"id": id, "size": size})
 }
 
@@ -109,7 +118,7 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	}
 	defer f.Close()
 	if err := s.st.TouchAttachment(r.Context(), id, store.NowMillis()); err != nil {
-		log.Printf("[attach] 更新访问时间失败 %s: %v", maskID(id), err)
+		logx.Debugf("[attach] 更新访问时间失败 %s: %v", maskID(id), err)
 	}
 	extendDeadlines(w, false, true, s.cfg.BlobTimeout)
 	w.Header().Set("Content-Type", "application/octet-stream")

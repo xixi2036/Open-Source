@@ -52,7 +52,7 @@ private fun NavBackStackEntry.arg(name: String): String = arguments?.getString(n
 fun HushNavHost() {
     val nav = rememberNavController()
     val startCall = rememberCallStarter()
-    var momentsReload by remember { mutableIntStateOf(0) }
+    var momentsReload by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(0) }
     val pending by NavRequests.conversation.collectAsState()
     LaunchedEffect(pending) {
         pending?.let { conv ->
@@ -95,7 +95,7 @@ fun HushNavHost() {
             val conv = e.arg("convId")
             ChatScreen(
                 conv, onBack = ::back, onSettings = { nav.navigate(Routes.chatSettings(conv)) },
-                onOpenImage = { nav.navigate(Routes.image(it)) }, onCall = startCall,
+                onOpenImage = { path, c -> nav.navigate(Routes.image(path, c)) }, onCall = startCall,
                 focusMessageId = e.arguments?.getString("msg"),
             )
         }
@@ -113,8 +113,14 @@ fun HushNavHost() {
             }
         }
         composable(Routes.SAFETY) { e -> Page { SafetyNumberScreen(e.arg("userId"), ::back) { nav.navigate(Routes.scan(it)) } } }
-        composable(Routes.IMAGE, arguments = listOf(navArgument("path") { type = NavType.StringType; defaultValue = "" })) { e ->
-            ImageViewerScreen(e.arg("path"), ::back)
+        composable(
+            Routes.IMAGE,
+            arguments = listOf(
+                navArgument("path") { type = NavType.StringType; defaultValue = "" },
+                navArgument("conv") { type = NavType.StringType; nullable = true; defaultValue = null },
+            ),
+        ) { e ->
+            ImageViewerScreen(e.arg("path"), ::back, convId = e.arguments?.getString("conv"))
         }
         composable(Routes.ARCHIVED) { Page { ArchivedScreen(::back, ::openChat) } }
         composable(Routes.SEARCH) { Page { SearchScreen(::back, ::openChat) { conv, msg -> nav.navigate(Routes.chat(conv, msg)) } } }

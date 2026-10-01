@@ -24,16 +24,57 @@ pub fn build_http() -> reqwest::Client {
         .expect("reqwest client")
 }
 
-/// 规范化服务器地址：去掉末尾 `/`，缺省协议补 `http://`。
-pub fn normalize_base(url: &str) -> Result<String> {
+/// 主机是否在本机 / 内网（B1）：回环、RFC1918 私有网段、链路本地、CGNAT（100.64/10，Tailscale 等）、
+/// IPv6 的 ULA 与链路本地，以及只在内网能解析的主机名（`localhost`、单标签主机名、`.local` / `.lan` /
+/// `.internal` / `.home.arpa` / `.localhost`）。这些地址允许明文 http（开发机、模拟器的 `10.0.2.2`、局域网自建服务）。
+pub fn is_local_host(host: &url::Host<&str>) -> bool {
+    fn v4(ip: &std::net::Ipv4Addr) -> bool {
+        let o = ip.octets();
+        ip.is_loopback() || ip.is_private() || ip.is_link_local() || (o[0] == 100 && (o[1] & 0xC0) == 64)
+    }
+    match host {
+        url::Host::Ipv4(ip) => v4(ip),
+        url::Host::Ipv6(ip) => {
+            let seg = ip.segments()[0];
+            ip.is_loopback() || (seg & 0xFE00) == 0xFC00 || (seg & 0xFFC0) == 0xFE80 || ip.to_ipv4_mapped().is_some_and(|m| v4(&m))
+        }
+        url::Host::Domain(d) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost"
+                || !d.contains('.')
+                || [".localhost", ".local", ".lan", ".internal", ".home.arpa"].iter().any(|suffix| d.ends_with(suffix))
+        }
+    }
+}
+
+/// 检查已规范化的服务器地址是否允许使用（B1）：必须是 http / https；**公网地址只允许 https**，
+/// 除非 `allow_insecure_http`（调试开关）。明文 http 下 token、元数据都在链路上裸奔，任何中间人都能伪造响应。
+pub fn ensure_secure(base: &str, allow_insecure_http: bool) -> Result<()> {
+    let u = url::Url::parse(base).map_err(|e| HushError::invalid(format!("服务器地址无效: {e}")))?;
+    let host = u.host().ok_or_else(|| HushError::invalid("服务器地址缺少主机名"))?;
+    match u.scheme() {
+        "https" => Ok(()),
+        "http" if allow_insecure_http || is_local_host(&host) => Ok(()),
+        "http" => Err(HushError::invalid("公网服务器地址必须使用 https（只有本机与内网地址允许 http）")),
+        other => Err(HushError::invalid(format!("不支持的协议 {other}，服务器地址须为 https:// 或 http://"))),
+    }
+}
+
+/// 规范化服务器地址：去掉末尾 `/`；没写协议时，本机 / 内网地址补 `http://`，其余补 `https://`（B1）。
+/// 公网地址显式写 `http://` 会被拒绝，除非 `allow_insecure_http`。
+pub fn normalize_base(url: &str, allow_insecure_http: bool) -> Result<String> {
     let mut s = url.trim().trim_end_matches('/').to_string();
     if s.is_empty() {
         return Err(HushError::invalid("服务器地址为空"));
     }
-    if !s.starts_with("http://") && !s.starts_with("https://") {
-        s = format!("http://{s}");
+    if !s.contains("://") {
+        let local = url::Url::parse(&format!("http://{s}"))
+            .map_err(|e| HushError::invalid(format!("服务器地址无效: {e}")))?
+            .host()
+            .is_some_and(|h| is_local_host(&h));
+        s = format!("{}://{s}", if local || allow_insecure_http { "http" } else { "https" });
     }
-    url::Url::parse(&s).map_err(|e| HushError::invalid(format!("服务器地址无效: {e}")))?;
+    ensure_secure(&s, allow_insecure_http)?;
     Ok(s)
 }
 
@@ -170,31 +211,54 @@ impl Api {
     }
 
     /// 流式下载到文件，边写边算 SHA-256，返回 (digest, 字节数)。
-    pub async fn download_to(&self, id: &str, path: &std::path::Path) -> Result<([u8; 32], u64)> {
+    /// `max_bytes`（B2）：响应声明的长度或实际收到的字节数超过它就中止——调用方按消息里声明的附件大小给出上限。
+    pub async fn download_to(&self, id: &str, path: &std::path::Path, max_bytes: u64) -> Result<([u8; 32], u64)> {
         use futures_util::StreamExt;
         use sha2::{Digest, Sha256};
         use tokio::io::AsyncWriteExt;
         let rb = self.req(Method::GET, &format!("/v1/attachments/{}", enc(id))).timeout(BLOB_TIMEOUT);
         let resp = self.check(rb.send().await?).await?;
+        let too_large = || HushError::invalid("附件比消息里声明的大小大，已中止下载");
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            return Err(too_large());
+        }
         let mut f = tokio::fs::File::create(path).await?;
         let mut hasher = Sha256::new();
         let mut n = 0u64;
         let mut body = resp.bytes_stream();
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
+            n += chunk.len() as u64;
+            if n > max_bytes {
+                return Err(too_large());
+            }
             hasher.update(&chunk);
             f.write_all(&chunk).await?;
-            n += chunk.len() as u64;
         }
         f.flush().await?;
         f.sync_all().await?;
         Ok((hasher.finalize().into(), n))
     }
 
-    pub async fn download(&self, id: &str) -> Result<Vec<u8>> {
+    /// 下载到内存（头像、朋友圈图片等明文媒体）。超过 `max_bytes` 中止（B2）。
+    pub async fn download(&self, id: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        use futures_util::StreamExt;
         let rb = self.req(Method::GET, &format!("/v1/attachments/{}", enc(id))).timeout(BLOB_TIMEOUT);
         let resp = self.check(rb.send().await?).await?;
-        Ok(resp.bytes().await?.to_vec())
+        let too_large = || HushError::invalid("媒体文件过大，已中止下载");
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            return Err(too_large());
+        }
+        let mut out = Vec::new();
+        let mut body = resp.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            if (out.len() + chunk.len()) as u64 > max_bytes {
+                return Err(too_large());
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 }
 
@@ -320,9 +384,51 @@ mod tests {
 
     #[test]
     fn base_normalization() {
-        assert_eq!(normalize_base("127.0.0.1:8080/").unwrap(), "http://127.0.0.1:8080");
-        assert_eq!(normalize_base("https://a.b").unwrap(), "https://a.b");
-        assert!(normalize_base("  ").is_err());
+        assert_eq!(normalize_base("127.0.0.1:8080/", false).unwrap(), "http://127.0.0.1:8080");
+        assert_eq!(normalize_base("https://a.b", false).unwrap(), "https://a.b");
+        assert!(normalize_base("  ", false).is_err());
+    }
+
+    /// B1：本机与内网地址照常可以用 http（两端与本地部署都这么用）；公网地址强制 https。
+    #[test]
+    fn public_hosts_require_https() {
+        let n = |u: &str| normalize_base(u, false);
+        // 现有用法保持可用
+        for ok in [
+            "http://10.0.2.2:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://192.168.1.23:8080",
+            "http://172.16.5.4",
+            "http://172.31.255.1:80",
+            "http://169.254.10.1",
+            "http://100.100.1.2:8080",
+            "http://[::1]:8080",
+            "http://[fd12:3456::1]:8080",
+            "http://[fe80::1]:8080",
+            "http://hush.local:8080",
+            "http://nas.lan",
+            "http://hush-server:8080",
+            "https://hush.example.com",
+        ] {
+            assert_eq!(n(ok).unwrap(), ok, "{ok}");
+        }
+        // 没写协议：内网补 http，公网补 https
+        assert_eq!(n("192.168.1.23:8080").unwrap(), "http://192.168.1.23:8080");
+        assert_eq!(n("10.0.2.2:8080").unwrap(), "http://10.0.2.2:8080");
+        assert_eq!(n("hush.example.com").unwrap(), "https://hush.example.com");
+        assert_eq!(n("8.8.8.8:8443").unwrap(), "https://8.8.8.8:8443");
+        // 公网明文 http：拒绝
+        for bad in ["http://hush.example.com", "http://8.8.8.8:8080", "http://172.32.0.1", "http://100.128.0.1", "http://[2001:db8::1]", "http://evil.localhost.example.com"] {
+            assert!(matches!(n(bad), Err(HushError::InvalidInput { .. })), "{bad}");
+            assert!(ensure_secure(bad, false).is_err());
+        }
+        assert!(n("ftp://a.b").is_err());
+        assert!(n("ws://127.0.0.1").is_err());
+        // 调试开关
+        assert_eq!(normalize_base("http://hush.example.com", true).unwrap(), "http://hush.example.com");
+        assert_eq!(normalize_base("hush.example.com", true).unwrap(), "http://hush.example.com", "开关打开时保持旧的缺省协议");
+        assert!(ensure_secure("http://8.8.8.8", true).is_ok());
     }
 
     #[test]

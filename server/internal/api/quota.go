@@ -11,7 +11,9 @@ import (
 // queueLimits 是接收方队列配额。策略：队列满（条数或字节超限）时**拒收新信封**，不丢弃已有数据；
 // 服务端事件不受此限制。检查在入队事务内完成（见 store.Enqueue）。
 func (s *Server) queueLimits() store.QueueLimits {
-	return store.QueueLimits{MaxItems: s.cfg.QueueMaxItems, MaxBytes: s.cfg.QueueMaxBytes}
+	set := s.set()
+	return store.QueueLimits{MaxItems: set.QueueMaxItems, MaxBytes: set.QueueMaxBytes,
+		SenderMaxItems: set.SenderQueueMaxItems, SenderMaxBytes: set.SenderQueueMaxBytes}
 }
 
 // uploadReservations 记录各用户正在进行中的上传所预占的字节数。
@@ -37,7 +39,7 @@ func (u *uploadReservations) reserve(ctx context.Context, s *Server, uid string,
 	if err != nil {
 		return nil, err
 	}
-	if used+u.reserved[uid]+n > s.cfg.DailyUploadBytes {
+	if used+u.reserved[uid]+n > s.set().DailyUploadBytes {
 		return nil, nil
 	}
 	u.reserved[uid] += n
@@ -53,7 +55,7 @@ func (r *uploadReservation) resize(ctx context.Context, n int64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if used+u.reserved[r.uid]-r.size+n > r.s.cfg.DailyUploadBytes {
+	if used+u.reserved[r.uid]-r.size+n > r.s.set().DailyUploadBytes {
 		return false, nil
 	}
 	u.reserved[r.uid] += n - r.size

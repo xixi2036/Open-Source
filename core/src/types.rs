@@ -252,9 +252,16 @@ pub enum GroupRole {
     Member,
 }
 
+/// 服务端以后新增的群角色按普通成员处理（权限最小），不让整个群信息解析失败。
+fn de_group_role<'de, D: serde::Deserializer<'de>>(d: D) -> Result<GroupRole, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or(GroupRole::Member))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, uniffi::Record)]
 pub struct GroupMember {
     pub user_id: String,
+    #[serde(deserialize_with = "de_group_role")]
     pub role: GroupRole,
     #[serde(default)]
     pub joined_at: i64,

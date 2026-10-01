@@ -79,6 +79,7 @@ func (t *Tx) Login(email, platform, deviceName, tokenHash string) (LoginResult, 
 		return res, err
 	default:
 		u.DeviceGeneration++
+		t.InvalidateUserTokens(u.ID)
 		stmts := []string{
 			"DELETE FROM tokens WHERE user_id = ?",
 			"DELETE FROM identity_keys WHERE user_id = ?",

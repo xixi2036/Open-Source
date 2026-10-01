@@ -22,8 +22,9 @@ object ContactsStore {
     val requests: StateFlow<FriendRequests> = _requests
 
     /** user_id → Profile（好友、群成员、陌生人资料）。 */
-    private val _profiles = MutableStateFlow<Map<String, Profile>>(emptyMap())
-    val profiles: StateFlow<Map<String, Profile>> = _profiles
+    private val store = com.hush.app.util.BatchedMapFlow<String, Profile>(HushCore.scope)
+    /** C2：写入按 50ms 时间窗合并后一次发射，不再每写一项就复制整张表。 */
+    val profiles: StateFlow<Map<String, Profile>> = store.flow
 
     private val inFlight = ConcurrentHashMap.newKeySet<String>()
 
@@ -31,7 +32,7 @@ object ContactsStore {
 
     suspend fun refreshRequests() {
         _requests.value = net { core.listFriendRequests() }
-        (_requests.value.incoming.map { it.from } + _requests.value.outgoing.map { it.to }).forEach(::put)
+        store.putAll((_requests.value.incoming.map { it.from } + _requests.value.outgoing.map { it.to }).associateBy { it.id })
     }
 
     /** 本机刚处理（接受/拒绝）的申请：立即更新状态，Tab 与“新的朋友”红点随之消失。 */
@@ -51,36 +52,36 @@ object ContactsStore {
     private fun setFriends(list: List<Profile>) {
         // 与通讯录一致：按拼音/字母分组顺序（选择好友列表等处直接使用该顺序）
         _friends.value = com.hush.app.util.ContactIndex.group(list) { it.name }.flatMap { it.second }
-        list.forEach(::put)
+        store.putAll(list.associateBy { it.id })
     }
 
     fun isFriend(userId: String) = _friends.value.any { it.id == userId }
 
     fun put(p: Profile) {
-        _profiles.update { it + (p.id to p) }
+        store.put(p.id, p)
     }
 
     /** 已缓存的资料（不触发拉取）。 */
-    fun cached(userId: String): Profile? = _profiles.value[userId]
+    fun cached(userId: String): Profile? = store[userId]
 
     /** 同步取名字；本地没有时异步拉取。 */
     fun nameOf(userId: String): String {
         if (userId.isEmpty()) return ""
         HushCore.account.value?.let { if (it.userId == userId) return it.profile.name }
-        _profiles.value[userId]?.let { return it.name }
+        store[userId]?.let { return it.name }
         ensure(userId)
         return "用户"
     }
 
     fun profileOf(userId: String): Profile? {
         HushCore.account.value?.let { if (it.userId == userId) return it.profile }
-        return _profiles.value[userId] ?: run { ensure(userId); null }
+        return store[userId] ?: run { ensure(userId); null }
     }
 
     /** 确保资料已加载：先查本地缓存，再请求服务端。 */
     fun ensure(userId: String, force: Boolean = false) {
         if (userId.isEmpty()) return
-        if (!force && _profiles.value.containsKey(userId)) return
+        if (!force && store.containsKey(userId)) return
         if (!inFlight.add(userId)) return
         HushCore.scope.launch(Dispatchers.IO) {
             try {
@@ -95,6 +96,6 @@ object ContactsStore {
     fun clear() {
         _friends.value = emptyList()
         _requests.value = FriendRequests(emptyList(), emptyList())
-        _profiles.value = emptyMap()
+        store.clear()
     }
 }

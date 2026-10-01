@@ -1,10 +1,40 @@
 import SwiftUI
 import UIKit
 
+/// C7：附件文件是否存在的短时缓存。气泡每次渲染都要知道「本地有没有这个文件」，
+/// 直接 fileExists 会在滚动时反复做系统调用；这里把结果记 10 秒。
+/// 用户点击（打开、播放、分享）时用 fresh: true 重新检查，避免用到已被核心删除的文件。
+enum AttachmentFiles {
+    private struct Entry { var exists: Bool; var at: CFAbsoluteTime }
+    nonisolated(unsafe) private static var entries: [String: Entry] = [:]
+    private static let lock = NSLock()
+    static let ttl: CFAbsoluteTime = 10
+
+    static func exists(_ path: String, fresh: Bool = false, now: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if !fresh, let e = entries[path], now - e.at < ttl { return e.exists }
+        let ok = FileManager.default.fileExists(atPath: path)
+        if entries.count > 2000 { entries.removeAll() }
+        entries[path] = Entry(exists: ok, at: now)
+        return ok
+    }
+
+    static func reset() {
+        lock.lock(); defer { lock.unlock() }
+        entries.removeAll()
+    }
+}
+
 extension AttachmentItem {
-    /// 本地已有的明文文件路径（存在才返回）
+    /// 本地已有的明文文件路径（存在才返回；结果有短时缓存）
     var existingPath: String? {
-        guard let p = localPath, FileManager.default.fileExists(atPath: p) else { return nil }
+        guard let p = localPath, AttachmentFiles.exists(p) else { return nil }
+        return p
+    }
+
+    /// 同上，但重新检查文件是否还在（用户点击时用）
+    var verifiedPath: String? {
+        guard let p = localPath, AttachmentFiles.exists(p, fresh: true) else { return nil }
         return p
     }
 }
@@ -12,69 +42,168 @@ extension AttachmentItem {
 /// 下载附件（结果会通过 MessageUpdated 事件回写 localPath）
 @MainActor
 enum AttachmentLoader {
-    static func ensure(_ m: MessageItem, index: Int) async -> String? {
+    /// userInitiated：用户点击触发——失败时提示一次原因，并且会重试之前失败过的附件。
+    /// 自动下载（滚入屏幕）失败时不弹提示，只记录失败状态，之后也不再自动重试（B5）。
+    static func ensure(_ m: MessageItem, index: Int, userInitiated: Bool = true) async -> String? {
         guard case let .attachments(items, _) = m.body, index < items.count else { return nil }
-        if let p = items[index].existingPath { return p }
+        if let p = items[index].verifiedPath { return p }
+        let chats = HushCore.shared.chats
+        if !userInitiated, chats.downloadFailure(m.id, index) != nil { return nil }
         do {
-            return try await HushCore.shared.chats.downloadAttachment(m.id, index: index)
+            let p = try await chats.downloadAttachment(m.id, index: index)
+            if let p { _ = AttachmentFiles.exists(p, fresh: true) }
+            return p
         } catch {
-            HushCore.shared.toast = "下载失败：\(describe(error))"
+            if userInitiated {
+                let f = DownloadFailure.classify(error)
+                HushCore.shared.toast = f == .expired ? "附件已过期，无法下载" : "下载失败：\(describe(error))"
+            }
             return nil
         }
     }
 }
 
-/// 图片消息：先显示缩略图（模糊），自动下载后显示原图，点击全屏
+/// 附件下载失败 / 已过期时盖在缩略图上的状态
+struct AttachmentFailureBadge: View {
+    let failure: DownloadFailure
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: failure == .expired ? "clock.badge.xmark" : "arrow.clockwise.circle.fill")
+                .font(.system(size: 26))
+            Text(failure.text).font(Fonts.timestamp).multilineTextAlignment(.center)
+        }
+        .foregroundStyle(.white)
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.45))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(failure == .expired ? "attachmentExpired" : "attachmentFailed")
+    }
+}
+
+/// 图片 / 视频气泡的显示尺寸
+func mediaDisplaySize(width: UInt32, height: UInt32) -> CGSize {
+    let maxW: CGFloat = 220, maxH: CGFloat = 280
+    guard width > 0, height > 0 else { return CGSize(width: 200, height: 200) }
+    let w = CGFloat(width), h = CGFloat(height)
+    let s = min(maxW / w, maxH / h)
+    return CGSize(width: max(w * s, 100), height: max(h * s, 80))
+}
+
+/// 图片消息：先显示缩略图（模糊），自动下载后显示原图，点击全屏。
+/// 自动下载失败后显示失败态（点击重试）；服务器上已清理的显示「附件已过期」。
 struct ImageAttachmentView: View {
     let message: MessageItem
     let item: AttachmentItem
     let index: Int
     var onOpen: (String) -> Void
+    var chats = HushCore.shared.chats
 
-    private var displaySize: CGSize {
-        let maxW: CGFloat = 220, maxH: CGFloat = 280
-        let w = CGFloat(max(item.width, 1)), h = CGFloat(max(item.height, 1))
-        guard item.width > 0, item.height > 0 else { return CGSize(width: 200, height: 200) }
-        let s = min(maxW / w, maxH / h)
-        return CGSize(width: max(w * s, 100), height: max(h * s, 80))
-    }
+    private var displaySize: CGSize { mediaDisplaySize(width: item.width, height: item.height) }
+    private var failure: DownloadFailure? { chats.downloadFailure(message.id, index) }
 
     @ViewBuilder private var placeholder: some View {
         if let t = item.thumbnail, let img = UIImage(data: t) {
             ZStack {
                 Image(uiImage: img).resizable().scaledToFill().blur(radius: 8)
-                ProgressView().tint(.white)
+                if failure == nil { ProgressView().tint(.white) }
             }
         } else {
             ZStack {
                 Theme.surface
-                ProgressView()
+                if failure == nil { ProgressView() }
             }
         }
     }
 
     var body: some View {
+        let local = item.existingPath
         ZStack {
-            if let p = item.existingPath {
+            if let p = local {
                 LocalImage(path: p, maxPixel: 700) { placeholder }
             } else {
                 placeholder
+                if let failure { AttachmentFailureBadge(failure: failure) }
             }
         }
         .frame(width: displaySize.width, height: displaySize.height)
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .contentShape(Rectangle())
         .onTapGesture {
-            if let p = item.existingPath { onOpen(p) } else {
-                Task { if let p = await AttachmentLoader.ensure(message, index: index) { onOpen(p) } }
-            }
+            Task { if let p = await AttachmentLoader.ensure(message, index: index) { onOpen(p) } }
         }
         .task(id: message.id) {
-            if item.existingPath == nil && !message.deleted { _ = await AttachmentLoader.ensure(message, index: index) }
+            if local == nil && !message.deleted { _ = await AttachmentLoader.ensure(message, index: index, userInitiated: false) }
         }
         .accessibilityElement()
-        .accessibilityLabel("图片")
+        .accessibilityLabel(local == nil ? (failure?.text ?? "图片，正在下载") : "图片")
         .accessibilityIdentifier("imageMessage")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+/// 视频消息：封面（发送方附带的缩略图，或已下载文件的首帧）+ 播放按钮 + 时长 / 大小。
+/// 不自动下载（可能很大）；点击后下载并用内置播放器播放。
+struct VideoAttachmentView: View {
+    let message: MessageItem
+    let item: AttachmentItem
+    let index: Int
+    var onOpen: (String) -> Void
+    var chats = HushCore.shared.chats
+    @State private var loading = false
+    @State private var cover: UIImage?
+
+    private var displaySize: CGSize { mediaDisplaySize(width: item.width, height: item.height) }
+    private var failure: DownloadFailure? { chats.downloadFailure(message.id, index) }
+
+    var body: some View {
+        let local = item.existingPath
+        ZStack {
+            if let cover {
+                Image(uiImage: cover).resizable().scaledToFill()
+            } else if let t = item.thumbnail, let img = UIImage(data: t) {
+                Image(uiImage: img).resizable().scaledToFill()
+            } else {
+                Color.black.opacity(0.75)
+            }
+            if let failure, local == nil {
+                AttachmentFailureBadge(failure: failure)
+            } else if loading {
+                ProgressView().tint(.white).controlSize(.large)
+            } else {
+                Image(systemName: local == nil ? "arrow.down.circle.fill" : "play.circle.fill")
+                    .font(.system(size: 46)).foregroundStyle(.white.opacity(0.92))
+                    .shadow(color: .black.opacity(0.4), radius: 4)
+            }
+        }
+        .frame(width: displaySize.width, height: displaySize.height)
+        .overlay(alignment: .bottomLeading) {
+            HStack(spacing: 4) {
+                Image(systemName: "video.fill")
+                Text(item.durationMs > 0 ? Fmt.duration(Int((item.durationMs + 500) / 1000)) : "视频")
+                if local == nil { Text("· " + Fmt.fileSize(item.size)) }
+            }
+            .font(Fonts.timestamp).foregroundStyle(.white)
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(Capsule().fill(.black.opacity(0.5)))
+            .padding(6)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !loading else { return }
+            loading = true
+            Task {
+                if let p = await AttachmentLoader.ensure(message, index: index) { onOpen(p) }
+                loading = false
+            }
+        }
+        .task(id: local) {
+            if let local { cover = await VideoThumbnails.load(local) }
+        }
+        .accessibilityElement()
+        .accessibilityLabel("视频 \(Int(item.durationMs / 1000)) 秒" + (failure.map { "，" + $0.text } ?? ""))
+        .accessibilityIdentifier("videoMessage")
         .accessibilityAddTraits(.isButton)
     }
 }
@@ -86,10 +215,12 @@ struct VoiceAttachmentView: View {
     let index: Int
     let outgoing: Bool
     var player = VoicePlayer.shared
+    var chats = HushCore.shared.chats
 
     var body: some View {
         let playing = player.playingId == message.id
         let fg = outgoing ? Theme.onAccent : Theme.textPrimary
+        let failure = item.existingPath == nil ? chats.downloadFailure(message.id, index) : nil
         HStack(spacing: 10) {
             Image(systemName: playing ? "stop.circle.fill" : "play.circle.fill")
                 .font(.system(size: 30))
@@ -97,8 +228,12 @@ struct VoiceAttachmentView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Waveform(seed: message.id, progress: playing ? player.progress : 0, color: fg)
                     .frame(width: waveWidth, height: 20)
-                Text(Fmt.duration(Int((item.durationMs + 500) / 1000)))
-                    .font(Fonts.timestamp).foregroundStyle(fg.opacity(0.8))
+                HStack(spacing: 6) {
+                    Text(Fmt.duration(Int((item.durationMs + 500) / 1000)))
+                    if playing && player.earpiece { Image(systemName: "ear").accessibilityLabel("听筒播放") }
+                    if let failure { Text(failure.text).accessibilityIdentifier("attachmentFailedText") }
+                }
+                .font(Fonts.timestamp).foregroundStyle(fg.opacity(0.8))
             }
         }
         .padding(.vertical, 2)
@@ -109,7 +244,7 @@ struct VoiceAttachmentView: View {
             }
         }
         .accessibilityElement()
-        .accessibilityLabel("语音 \(Int(item.durationMs / 1000)) 秒")
+        .accessibilityLabel("语音 \(Int(item.durationMs / 1000)) 秒" + (playing ? "，正在播放" : ""))
         .accessibilityIdentifier("voiceMessage")
         .accessibilityAddTraits(.isButton)
     }
@@ -158,10 +293,12 @@ struct FileAttachmentView: View {
     let index: Int
     let outgoing: Bool
     var onShare: (URL) -> Void
+    var chats = HushCore.shared.chats
     @State private var loading = false
 
     var body: some View {
         let fg = outgoing ? Theme.onAccent : Theme.textPrimary
+        let failure = item.existingPath == nil ? chats.downloadFailure(message.id, index) : nil
         HStack(spacing: 10) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8).fill(outgoing ? Color.white.opacity(0.2) : Theme.accent.opacity(0.15))
@@ -172,7 +309,7 @@ struct FileAttachmentView: View {
             .frame(width: 40, height: 44)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.fileName).font(Fonts.body).foregroundStyle(fg).lineLimit(2)
-                Text(Fmt.fileSize(item.size)).font(Fonts.timestamp).foregroundStyle(fg.opacity(0.75))
+                Text(failure?.text ?? Fmt.fileSize(item.size)).font(Fonts.timestamp).foregroundStyle(fg.opacity(0.75))
             }
         }
         .frame(maxWidth: 240, alignment: .leading)

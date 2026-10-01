@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
+	"time"
 )
 
 // 朋友圈可见范围模式。
@@ -68,20 +70,28 @@ type MomentNotification struct {
 	CreatedAt int64   `json:"created_at"`
 }
 
-// visibleClause 是「动态 m 对查看者可见」的 SQL 条件，需要 4 个查看者 id 参数。
-// 规则：作者本人；或作者的好友且满足 all / include 名单内 / exclude 名单外。
+// visibleClause 是「动态 m 对查看者可见」的 SQL 条件，需要 6 个查看者 id 参数。
+// 规则：作者本人；或作者的好友、双方都没有拉黑对方，且满足 all / include 名单内 / exclude 名单外。
 const visibleClause = `(m.author_id = ? OR (
 	EXISTS (SELECT 1 FROM friendships f WHERE f.user_id = m.author_id AND f.friend_id = ?)
-	AND (m.vis_mode = 'all'
+	AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.user_id = m.author_id AND b.blocked_id = ?) OR (b.user_id = ? AND b.blocked_id = m.author_id))
+	AND ` + visLite + `))`
+
+// visLite 是可见范围名单的判断（不含好友 / 拉黑关系），需要 2 个查看者 id 参数。
+const visLite = `(m.vis_mode = 'all'
 		OR (m.vis_mode = 'include' AND EXISTS (SELECT 1 FROM moment_visibility mv WHERE mv.moment_id = m.id AND mv.user_id = ?))
-		OR (m.vis_mode = 'exclude' AND NOT EXISTS (SELECT 1 FROM moment_visibility mv WHERE mv.moment_id = m.id AND mv.user_id = ?)))))`
+		OR (m.vis_mode = 'exclude' AND NOT EXISTS (SELECT 1 FROM moment_visibility mv WHERE mv.moment_id = m.id AND mv.user_id = ?)))`
 
-func visibleArgs(viewer string) []any { return []any{viewer, viewer, viewer, viewer} }
+func visibleArgs(viewer string) []any { return []any{viewer, viewer, viewer, viewer, viewer, viewer} }
 
-// friendOrSelf 是「user 列是查看者本人或其好友」的条件，需要 2 个查看者 id 参数。
+// friendOrSelf 是「user 列是查看者本人，或其好友且双方没有拉黑关系」的条件，需要 4 个查看者 id 参数（见 friendOrSelfArgs）。
 func friendOrSelf(col string) string {
-	return "(" + col + " = ? OR " + col + " IN (SELECT friend_id FROM friendships WHERE user_id = ?))"
+	return "(" + col + " = ? OR (" + col + " IN (SELECT friend_id FROM friendships WHERE user_id = ?)" +
+		" AND " + col + " NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)" +
+		" AND " + col + " NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?)))"
 }
+
+func friendOrSelfArgs(viewer string) []any { return []any{viewer, viewer, viewer, viewer} }
 
 const momentCols = "m.id, m.author_id, m.text, m.media, m.vis_mode, m.created_at"
 
@@ -104,8 +114,11 @@ func scanMoment(sc interface{ Scan(...any) error }) (MomentRow, error) {
 	return r, nil
 }
 
-// CreateMoment 发布动态。
-func (s *Store) CreateMoment(ctx context.Context, authorID, text string, media []Media, vis Visibility) (MomentRow, error) {
+// CreateMoment 发布动态。全部检查与写入在一个事务里：
+//   - dailyLimit > 0 时，作者最近 24 小时已发布 dailyLimit 条则返回 ErrRateLimited；
+//   - 图片必须是作者自己上传的附件，否则返回 ErrNotFound；
+//   - include / exclude 名单只保留作者的好友（非好友本来就看不到，乱填的 id 直接丢弃），返回的 vis 是实际生效的名单。
+func (s *Store) CreateMoment(ctx context.Context, authorID, text string, media []Media, vis Visibility, dailyLimit int) (MomentRow, error) {
 	if media == nil {
 		media = []Media{}
 	}
@@ -113,27 +126,55 @@ func (s *Store) CreateMoment(ctx context.Context, authorID, text string, media [
 	if err != nil {
 		return MomentRow{}, err
 	}
+	var list string
+	if vis.Mode != VisAll && len(vis.UserIDs) > 0 {
+		b, err := json.Marshal(vis.UserIDs)
+		if err != nil {
+			return MomentRow{}, err
+		}
+		list = string(b)
+	}
 	r := MomentRow{ID: NewID(), AuthorID: authorID, Text: text, Media: media, VisMode: vis.Mode, CreatedAt: NowMillis()}
-	err = s.withTx(ctx, func(tx *sql.Tx) error {
+	err = s.withTx(ctx, func(tx dbtx) error {
+		if dailyLimit > 0 {
+			var n int
+			if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM moments WHERE author_id = ? AND created_at >= ?",
+				authorID, r.CreatedAt-(24*time.Hour).Milliseconds()).Scan(&n); err != nil {
+				return err
+			}
+			if n >= dailyLimit {
+				return ErrRateLimited
+			}
+		}
+		seen := map[string]bool{}
+		for _, m := range media {
+			if seen[m.AttachmentID] {
+				continue
+			}
+			seen[m.AttachmentID] = true
+			if ok, err := exists(ctx, tx, "SELECT 1 FROM attachments WHERE id = ? AND uploader_id = ?", m.AttachmentID, authorID); err != nil {
+				return err
+			} else if !ok {
+				return ErrNotFound
+			}
+		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO moments (id, author_id, text, media, vis_mode, created_at) VALUES (?, ?, ?, ?, ?, ?)",
 			r.ID, authorID, text, string(raw), vis.Mode, r.CreatedAt); err != nil {
 			return err
 		}
 		// 关联表：附件清理据此判断图片仍被引用（同一张图出现两次只记一行）
-		for _, m := range media {
-			if _, err := tx.ExecContext(ctx, "INSERT INTO moment_media (moment_id, attachment_id) VALUES (?, ?) ON CONFLICT DO NOTHING", r.ID, m.AttachmentID); err != nil {
+		for id := range seen {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO moment_media (moment_id, attachment_id) VALUES (?, ?) ON CONFLICT DO NOTHING", r.ID, id); err != nil {
 				return err
 			}
 		}
-		if vis.Mode == VisAll {
+		if list == "" {
 			return nil
 		}
-		for _, uid := range vis.UserIDs {
-			if _, err := tx.ExecContext(ctx, "INSERT INTO moment_visibility (moment_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING", r.ID, uid); err != nil {
-				return err
-			}
-		}
-		return nil
+		_, err := tx.ExecContext(ctx, `INSERT INTO moment_visibility (moment_id, user_id)
+			SELECT ?, f.friend_id FROM friendships f WHERE f.user_id = ? AND f.friend_id IN (SELECT value FROM json_each(?))
+			ON CONFLICT DO NOTHING`, r.ID, authorID, list)
+		return err
 	})
 	return r, err
 }
@@ -172,15 +213,77 @@ func cursorClause(alias, table string) string {
 
 func (c Cursor) args() []any { return []any{c.Before, c.Before, c.BeforeID} }
 
+// feedAuthorsSQL 是动态流的作者范围：查看者本人 ∪ 没有拉黑关系的好友（1 个命名参数 ?1）。
+const feedAuthorsSQL = `SELECT ?1 UNION ALL SELECT f.friend_id FROM friendships f WHERE f.user_id = ?1
+	AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.user_id = f.friend_id AND b.blocked_id = ?1) OR (b.user_id = ?1 AND b.blocked_id = f.friend_id))`
+
+// feedVisible 是动态流里单条动态的可见条件（作者已限定为本人或好友，只需再看可见范围名单），3 个查看者 id 参数。
+const feedVisible = "(m.author_id = ? OR " + visLite + ")"
+
 // Feed 返回查看者可见的动态（本人 + 好友），按时间倒序，位于游标之前。
-// 先按作者（本人 ∪ 好友）限定范围，走 moments_author_time 索引，而不是扫描全服动态再逐行判断可见性。
+//
+// 不再把全部好友的全部动态取出来排序（首屏耗时随好友动态总数线性增长）。一页 N 条最多来自 N 个作者，而且只能是
+// 「最新一条可见动态」排在前 N 名的那些作者——所以分两步，都走 moments_author_time 索引：
+//  1. 每个作者取游标之前最新一条可见动态的时间（每人一次索引定位）；
+//  2. 只对最新的 N 个作者（含并列）各取前 N 条，归并后取前 N 条。
+//
+// 耗时与「好友数 + N²」成正比，与好友动态总数无关。
 func (s *Store) Feed(ctx context.Context, viewer string, cur Cursor, limit int) ([]MomentRow, error) {
-	args := append([]any{viewer, viewer}, cur.args()...)
-	args = append(args, visibleArgs(viewer)...)
-	args = append(args, limit)
-	return s.queryMoments(ctx, "SELECT "+momentCols+" FROM moments m WHERE m.author_id IN (SELECT friend_id FROM friendships WHERE user_id = ? UNION SELECT ?) AND "+
-		cursorClause("m", "moments")+" AND "+visibleClause+
-		" ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?", args...)
+	curArgs := cur.args()
+	args := append([]any{viewer}, curArgs...)
+	args = append(args, viewer, viewer, viewer)
+	rows, err := s.rd.QueryContext(ctx, `WITH authors(id) AS (`+feedAuthorsSQL+`)
+		SELECT a.id, (SELECT m.created_at FROM moments m WHERE m.author_id = a.id AND `+cursorClause("m", "moments")+` AND `+feedVisible+`
+			ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) FROM authors a`, args...)
+	if err != nil {
+		return nil, err
+	}
+	type latest struct {
+		id string
+		ts int64
+	}
+	var ls []latest
+	for rows.Next() {
+		var l latest
+		var ts sql.NullInt64
+		if err := rows.Scan(&l.id, &ts); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if ts.Valid {
+			l.ts = ts.Int64
+			ls = append(ls, l)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ls) == 0 {
+		return nil, nil
+	}
+	sort.Slice(ls, func(i, j int) bool { return ls[i].ts > ls[j].ts })
+	n := len(ls)
+	if n > limit {
+		n = limit
+		for n < len(ls) && ls[n].ts == ls[limit-1].ts { // 与第 N 名并列的作者也要带上
+			n++
+		}
+	}
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = ls[i].id
+	}
+	list, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	args = append([]any{string(list)}, curArgs...)
+	args = append(args, viewer, viewer, viewer, limit, limit)
+	return s.queryMoments(ctx, "SELECT "+momentCols+` FROM json_each(?) a JOIN moments m ON m.rowid IN (
+			SELECT m.rowid FROM moments m WHERE m.author_id = a.value AND `+cursorClause("m", "moments")+` AND `+feedVisible+`
+			ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?)
+		ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`, args...)
 }
 
 // UserMoments 返回某作者对查看者可见的动态。
@@ -233,7 +336,7 @@ func (s *Store) HydrateMoments(ctx context.Context, viewer string, rows []Moment
 	// 点赞
 	likes := map[string][]string{}
 	lrows, err := s.db.QueryContext(ctx, "SELECT moment_id, user_id FROM moment_likes WHERE moment_id IN ("+placeholders(len(ids))+") AND "+
-		friendOrSelf("user_id")+" ORDER BY created_at, rowid", append(idArgs, viewer, viewer)...)
+		friendOrSelf("user_id")+" ORDER BY created_at, rowid", append(idArgs[:len(idArgs):len(idArgs)], friendOrSelfArgs(viewer)...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +359,7 @@ func (s *Store) HydrateMoments(ctx context.Context, viewer string, rows []Moment
 	}
 	comments := map[string][]rawComment{}
 	crows, err := s.db.QueryContext(ctx, "SELECT id, moment_id, author_id, reply_to_id, text, created_at FROM moment_comments WHERE moment_id IN ("+
-		placeholders(len(ids))+") AND "+friendOrSelf("author_id")+" ORDER BY created_at, rowid", append(idArgs, viewer, viewer)...)
+		placeholders(len(ids))+") AND "+friendOrSelf("author_id")+" ORDER BY created_at, rowid", append(idArgs[:len(idArgs):len(idArgs)], friendOrSelfArgs(viewer)...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +447,7 @@ func (t *Tx) Like(momentID, userID string) (bool, error) {
 
 // Unlike 取消点赞，并删除对应的点赞通知。
 func (s *Store) Unlike(ctx context.Context, momentID, userID string) error {
-	return s.withTx(ctx, func(tx *sql.Tx) error {
+	return s.withTx(ctx, func(tx dbtx) error {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM moment_likes WHERE moment_id = ? AND user_id = ?", momentID, userID); err != nil {
 			return err
 		}
@@ -393,7 +496,7 @@ func (s *Store) GetComment(ctx context.Context, id string) (CommentRow, error) {
 
 // DeleteComment 删除评论及其通知。
 func (s *Store) DeleteComment(ctx context.Context, id string) error {
-	return s.withTx(ctx, func(tx *sql.Tx) error {
+	return s.withTx(ctx, func(tx dbtx) error {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM moment_notifications WHERE comment_id = ?", id); err != nil {
 			return err
 		}

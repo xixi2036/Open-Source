@@ -1,5 +1,47 @@
 import AVFoundation
 import Observation
+import UIKit
+
+/// 录音用到的系统音频能力。正式运行用 SystemVoiceCapture；单元测试注入假实现，
+/// 避免测试真的激活音频会话与麦克风（模拟器上激活音频会话偶尔会卡住十几秒以上）。
+@MainActor
+protocol VoiceCaptureBackend: AnyObject {
+    /// 激活音频会话并开始录到 url，返回是否真的在录音
+    func begin(url: URL) -> Bool
+    /// 停止录音并释放音频会话
+    func end()
+}
+
+@MainActor
+final class SystemVoiceCapture: VoiceCaptureBackend {
+    private var recorder: AVAudioRecorder?
+
+    func begin(url: URL) -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
+            try session.setActive(true)
+        } catch {
+            return false
+        }
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
+        ]
+        let r = try? AVAudioRecorder(url: url, settings: settings)
+        guard let r, r.record() else { return false }
+        recorder = r
+        return true
+    }
+
+    func end() {
+        recorder?.stop()
+        recorder = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
 
 /// 语音录制（m4a AAC）。按住说话的完整状态机：按下 → 检查麦克风权限 → 录音；
 /// 松手发送 / 上滑取消；达到上限自动结束并通过 onAutoFinish 交出结果，松手前不会重新开始。
@@ -13,12 +55,20 @@ final class VoiceRecorder {
     @ObservationIgnored var onAutoFinish: ((URL, UInt64) -> Void)?
     /// 麦克风权限（可在测试中替换）
     @ObservationIgnored var permission: () -> AVAudioApplication.recordPermission = { AVAudioApplication.shared.recordPermission }
-    @ObservationIgnored private var recorder: AVAudioRecorder?
+    /// 系统录音能力（可在测试中替换）
+    @ObservationIgnored var backend: VoiceCaptureBackend = SystemVoiceCapture()
+    /// 本次录音是否真的在录（模拟器没有麦克风时为 false，结束时改用静音文件）
+    @ObservationIgnored private var capturing = false
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var url: URL?
     @ObservationIgnored private var started: Date?
     /// 当前这一次按压是否已处理过（开始录音 / 请求权限 / 自动结束），防止同一次按压里重复开始
     @ObservationIgnored private(set) var pressActive = false
+    /// 正在录音的实例（来电 / 呼出时由 CallManager 取消）
+    private static weak var active: VoiceRecorder?
+
+    /// 通话开始时丢弃进行中的录音
+    static func cancelActive() { active?.cancel() }
 
     // MARK: - 手势入口
 
@@ -62,30 +112,20 @@ final class VoiceRecorder {
 
     func start(now: Date = Date()) {
         guard !isRecording else { return }
-        let session = AVAudioSession.sharedInstance()
-        var sessionOK = true
-        do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
-            try session.setActive(true)
-        } catch { sessionOK = false }
+        // 录音与语音播放互斥
+        VoicePlayer.shared.stop()
+        Self.active = self
         let url = AppPaths.newOutboxFile(ext: "m4a")
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: 44100,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
-        ]
-        let r = sessionOK ? try? AVAudioRecorder(url: url, settings: settings) : nil
-        let ok = r?.record() ?? false
+        let ok = backend.begin(url: url)
         #if !targetEnvironment(simulator)
         guard ok else {
             HushCore.shared.toast = "无法录音，请检查麦克风"
-            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            backend.end()
             return
         }
         #endif
         // 模拟器可能没有可用麦克风：录音失败时仍保持录音 UI，结束时生成静音文件，保证发送链路可验证（仅模拟器）
-        recorder = ok ? r : nil
+        capturing = ok
         self.url = url
         started = now
         elapsed = 0
@@ -112,11 +152,10 @@ final class VoiceRecorder {
         guard isRecording else { return nil }
         timer?.invalidate(); timer = nil
         isRecording = false
-        recorder?.stop()
-        let hadRecorder = recorder != nil
-        recorder = nil
+        let hadRecorder = capturing
+        capturing = false
+        backend.end()
         let duration = min(started.map { now.timeIntervalSince($0) } ?? elapsed, maxDuration)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         guard let url else { return nil }
         self.url = nil
         if cancel || duration < 1 {
@@ -150,20 +189,29 @@ enum SilentAudio {
     }
 }
 
-/// 语音播放（同一时间只播放一条）
+/// 语音播放（同一时间只播放一条）。
+/// 默认外放；播放期间打开距离传感器，手机贴近耳朵时改从听筒播放（B7 听筒模式），拿开后恢复外放。
+/// 播放结束释放音频会话并通知其他 App（被打断的音乐可以恢复）。
 @MainActor @Observable
 final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
     static let shared = VoicePlayer()
     var playingId: String?
     var progress: Double = 0
+    /// 当前是否从听筒播放
+    private(set) var earpiece = false
     @ObservationIgnored private var player: AVAudioPlayer?
     @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var proximityObserver: NSObjectProtocol?
 
     func toggle(id: String, path: String) {
         if playingId == id { stop(); return }
         stop()
+        guard !CallManager.shared.isLive else {
+            HushCore.shared.toast = "通话中无法播放语音"
+            return
+        }
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try applyRoute(earpiece: false)
             try AVAudioSession.sharedInstance().setActive(true)
             let p = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: path))
             p.delegate = self
@@ -179,16 +227,55 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
             }
             RunLoop.main.add(t, forMode: .common)
             timer = t
+            startProximity()
         } catch {
             HushCore.shared.toast = "无法播放语音"
         }
     }
 
     func stop() {
+        let wasPlaying = player != nil
         timer?.invalidate(); timer = nil
         player?.stop(); player = nil
         playingId = nil
         progress = 0
+        stopProximity()
+        if wasPlaying && !CallManager.shared.isLive {
+            // 释放音频会话，让被打断的其他 App 恢复播放
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+    }
+
+    /// 音频会话的类别：外放用 playback；听筒用 playAndRecord（不带 defaultToSpeaker 时输出到听筒）
+    nonisolated static func category(earpiece: Bool) -> AVAudioSession.Category { earpiece ? .playAndRecord : .playback }
+
+    private func applyRoute(earpiece: Bool) throws {
+        let s = AVAudioSession.sharedInstance()
+        try s.setCategory(Self.category(earpiece: earpiece), mode: earpiece ? .voiceChat : .default,
+                          options: earpiece ? [.allowBluetoothHFP] : [])
+        self.earpiece = earpiece
+    }
+
+    private func startProximity() {
+        UIDevice.current.isProximityMonitoringEnabled = true
+        proximityObserver = NotificationCenter.default.addObserver(
+            forName: UIDevice.proximityStateDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.player != nil else { return }
+                try? self.applyRoute(earpiece: UIDevice.current.proximityState)
+            }
+        }
+    }
+
+    private func stopProximity() {
+        if let o = proximityObserver { NotificationCenter.default.removeObserver(o) }
+        proximityObserver = nil
+        earpiece = false
+        // 通话中的距离传感器由 CallManager 管理，这里不去关它
+        if !CallManager.shared.isLive, UIDevice.current.isProximityMonitoringEnabled {
+            UIDevice.current.isProximityMonitoringEnabled = false
+        }
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {

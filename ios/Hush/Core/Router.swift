@@ -59,6 +59,16 @@ final class Router {
         }
     }
 
+    /// 当前 Tab 回到根页面（退群、删除好友后所在的设置页已失效）
+    func popToRoot() {
+        switch tab {
+        case .chats: chatPath = NavigationPath()
+        case .contacts: contactsPath = NavigationPath()
+        case .moments: momentsPath = NavigationPath()
+        case .me: mePath = NavigationPath()
+        }
+    }
+
     func reset() {
         tab = .chats
         chatPath = NavigationPath(); contactsPath = NavigationPath()

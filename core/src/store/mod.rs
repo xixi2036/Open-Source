@@ -78,6 +78,31 @@ CREATE TABLE IF NOT EXISTS drafts (conv_id TEXT PRIMARY KEY, text BLOB NOT NULL,
 UPDATE messages SET sort_ts=server_ts WHERE outgoing=1 AND server_ts>0 AND sort_ts<>server_ts;
 "#;
 
+/// v5（2026-09-30 审查修复）：
+/// - `messages.has_files`：该消息是否有本地附件文件（C5：删除 / 清空会话时不必解密全部消息找附件），随后回填；
+/// - 部分索引 `messages_unread`（C4 / A10：未读数实时统计、`mark_read` 只碰未读行）、`messages_files`；
+/// - `megolm_pending(sender, session_id)` 索引；
+/// - `megolm_in.seen_idx`：该入站会话已处理过的消息序号（A8：去重记录过期后重放的密文不再重新出现）；
+/// - 清理旧版本处理 `from` 为空的信封后留下的坏会话（A2：`u:` / `g:` 这类无法解析的会话 id 及其消息）；
+/// - 被极端 server_ts 顶到未来的会话时间拉回当前时间（A6）；
+/// - 未读数改为按消息表实时统计（A10）：旧计数为 0 的会话里残留的 `read=0` 行补成已读，升级后不会凭空多出未读。
+const V5_SCHEMA: &str = r#"
+ALTER TABLE messages ADD COLUMN has_files INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS messages_unread ON messages(conv_id) WHERE read=0 AND outgoing=0;
+CREATE INDEX IF NOT EXISTS messages_files ON messages(conv_id) WHERE has_files=1;
+CREATE INDEX IF NOT EXISTS megolm_pending_key ON megolm_pending(sender, session_id);
+ALTER TABLE megolm_in ADD COLUMN seen_idx TEXT NOT NULL DEFAULT '';
+DELETE FROM reactions WHERE message_id IN
+  (SELECT id FROM messages WHERE length(conv_id)<3 OR substr(conv_id,1,2) NOT IN ('u:','g:'));
+DELETE FROM messages WHERE length(conv_id)<3 OR substr(conv_id,1,2) NOT IN ('u:','g:');
+DELETE FROM drafts WHERE length(conv_id)<3 OR substr(conv_id,1,2) NOT IN ('u:','g:');
+DELETE FROM conversations WHERE length(conv_id)<3 OR substr(conv_id,1,2) NOT IN ('u:','g:');
+UPDATE conversations SET last_ts=CAST(strftime('%s','now') AS INTEGER)*1000
+  WHERE last_ts > (CAST(strftime('%s','now') AS INTEGER)+86400)*1000;
+UPDATE messages SET read=1 WHERE outgoing=0 AND read=0
+  AND conv_id IN (SELECT conv_id FROM conversations WHERE unread=0);
+"#;
+
 /// 一步迁移。`Sql` 不依赖库密钥；`Data` 需要解密 / 重新加密已有数据，只在库密钥校验通过之后执行。
 #[derive(Clone, Copy)]
 pub(crate) enum Migration {
@@ -90,11 +115,13 @@ pub(crate) enum Migration {
 /// - v2 新增 inbox 表（C-H）。
 /// - v3 给旧的通话记录补上结束原因（C-B，数据迁移，需要库密钥）。
 /// - v4（v3 收尾）：提及标记、草稿表、已发送消息 sort_ts 回填为 server_ts 并错开同一会话内的重复值。
+/// - v5（2026-09-30 审查修复）：见 `V5_SCHEMA`。
 const MIGRATIONS: &[Migration] = &[
     Migration::Sql(SCHEMA),
     Migration::Sql(V2_INBOX),
     Migration::Data(migrate_call_log_reason),
     Migration::Data(migrate_v4),
+    Migration::Data(migrate_v5),
 ];
 
 /// 当前库版本。
@@ -194,6 +221,84 @@ fn migrate_v4(tx: &rusqlite::Transaction, _cipher: &DbCipher) -> Result<()> {
         tx.execute("UPDATE messages SET sort_ts=?2 WHERE rowid=?1", params![rowid, ts])?;
     }
     Ok(())
+}
+
+/// v5：见 `V5_SCHEMA`。建列之后逐行解密正文，给已有本地附件文件的消息回填 `has_files=1`
+/// （只解析需要的字段，不为缩略图分配内存；正文无法读取的行保持 0）。
+fn migrate_v5(tx: &rusqlite::Transaction, cipher: &DbCipher) -> Result<()> {
+    tx.execute_batch(V5_SCHEMA)?;
+    let with_files: Vec<i64> = {
+        let mut st = tx.prepare("SELECT rowid, body FROM messages")?;
+        let mut rows = st.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let body: Vec<u8> = r.get(1)?;
+            let Ok(plain) = cipher.open(LABEL_BODY, &body) else { continue };
+            if serde_json::from_slice::<SlimMessage>(&plain).is_ok_and(|m| m.has_files()) {
+                out.push(r.get(0)?);
+            }
+        }
+        out
+    };
+    for rowid in with_files {
+        tx.execute("UPDATE messages SET has_files=1 WHERE rowid=?1", [rowid])?;
+    }
+    Ok(())
+}
+
+/// 只含搜索与「是否有本地文件」判断所需字段的消息正文视图：解析时跳过缩略图、密钥等大字段，不为它们分配内存。
+#[derive(Deserialize)]
+pub(crate) struct SlimMessage {
+    pub body: SlimBody,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub(crate) enum SlimBody {
+    Text {
+        text: String,
+    },
+    Attachments {
+        #[serde(default)]
+        items: Vec<SlimAttachment>,
+        #[serde(default)]
+        caption: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SlimAttachment {
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub local_path: Option<String>,
+}
+
+impl SlimMessage {
+    fn has_files(&self) -> bool {
+        matches!(&self.body, SlimBody::Attachments { items, .. } if items.iter().any(|a| a.local_path.is_some()))
+    }
+
+    /// 本地搜索（C2）：文字消息比对正文；附件只比对说明与文件名。`q` 已转小写。
+    pub fn matches(&self, q: &str) -> bool {
+        let hit = |s: &str| s.to_lowercase().contains(q);
+        match &self.body {
+            SlimBody::Text { text } => hit(text),
+            SlimBody::Attachments { items, caption } => caption.as_deref().is_some_and(hit) || items.iter().any(|a| hit(&a.file_name)),
+            SlimBody::Other => false,
+        }
+    }
+}
+
+/// 排序 / 会话时间最多比本机当前时间晚这么多（A6）：服务端给出的时间戳不可全信，
+/// 极端值（`i64::MAX`、2100 年）会让消息不可见或让会话永远置顶。
+pub(crate) const MAX_FUTURE_MS: i64 = 24 * 3600 * 1000;
+
+/// 把来自外部的时间戳钳到「当前时间 + 容差」以内；负数视为未知（0）。
+pub(crate) fn clamp_ts(ts: i64) -> i64 {
+    ts.clamp(0, crate::util::now_ms() + MAX_FUTURE_MS)
 }
 
 /// kv 中记录「已删除的会话曾设为免打扰」的键（K1：会话因新消息重新出现时沿用免打扰）。
@@ -324,11 +429,26 @@ impl StoredMessage {
     pub fn plain(body: StoredBody, quote: Option<Quote>) -> Self {
         StoredMessage { body, quote, forwarded: false, mentions: vec![] }
     }
+
+    /// 是否有本地附件文件（`messages.has_files` 列，C5）。
+    pub fn has_files(&self) -> bool {
+        matches!(&self.body, StoredBody::Attachments { items, .. } if items.iter().any(|a| a.local_path.is_some()))
+    }
+
+    /// 可见的聊天消息（文字 / 附件）：只有它们参与已读回执。
+    pub fn is_chat(&self) -> bool {
+        matches!(self.body, StoredBody::Text { .. } | StoredBody::Attachments { .. })
+    }
 }
 
 /// 消息 id 冲突时使用的派生 id。收到的内容 id 限定为 `[A-Za-z0-9_-]`（见 `valid_content_id`），不含 `:`，所以无法伪造。
 pub fn derived_message_id(sender_id: &str, content_id: &str) -> String {
     format!("{sender_id}:{content_id}")
+}
+
+/// 会话 id 是否合法：`u:<非空>` 或 `g:<非空>`。
+pub fn valid_conv_id(conv_id: &str) -> bool {
+    conv_id.len() > 2 && (conv_id.starts_with("u:") || conv_id.starts_with("g:"))
 }
 
 /// 收到的 `Content.id` 是否合法：1–128 个字符，只含字母数字、`-`、`_`（本库生成的是 UUID）。
@@ -418,6 +538,8 @@ impl Store {
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // B8：删除的内容（消息密文、会话 pickle、资料缓存）在页内清零，不留在空闲页里
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Self::migrate(&mut conn, MIGRATIONS, &cipher)?;
         Ok(Store { conn: Mutex::new(conn), cipher })
@@ -442,6 +564,21 @@ impl Store {
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 测试用：直接执行 SQL（构造旧版本留下的数据）。
+    #[cfg(test)]
+    pub fn debug_exec(&self, sql: &str) {
+        let c = self.conn();
+        let mut st = c.prepare(sql).unwrap();
+        let mut rows = st.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+    }
+
+    /// 测试用：执行返回单个整数的查询。
+    #[cfg(test)]
+    pub fn debug_query_i64(&self, sql: &str) -> i64 {
+        self.conn().query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
     // ---------- kv ----------
@@ -476,6 +613,15 @@ impl Store {
              DELETE FROM groups; DELETE FROM conversations; DELETE FROM messages; DELETE FROM reactions;
              DELETE FROM seen; DELETE FROM inbox; DELETE FROM drafts; DELETE FROM kv WHERE k NOT IN ('key_check');",
         )?;
+        Ok(())
+    }
+
+    /// 登出后收尾（B8）：把 WAL 合并回主库并截断、VACUUM 重建文件，已删除的数据不留在 WAL 与空闲页里。
+    pub fn compact_after_wipe(&self) -> Result<()> {
+        let c = self.conn();
+        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        c.execute_batch("VACUUM")?;
+        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
     }
 

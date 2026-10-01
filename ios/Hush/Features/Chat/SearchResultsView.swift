@@ -32,7 +32,7 @@ struct SearchResultsView: View {
                                 ConversationAvatar(convId: m.convId, size: 40)
                                 VStack(alignment: .leading, spacing: 2) {
                                     HStack {
-                                        Text(core.chats.title(m.convId)).font(.system(size: 15, weight: .medium))
+                                        Text(core.chats.title(m.convId)).font(Fonts.sized(15, weight: .medium))
                                         Spacer()
                                         Text(Fmt.listTime(m.sentAt)).font(Fonts.timestamp).foregroundStyle(Theme.textSecondary)
                                     }

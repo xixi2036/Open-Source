@@ -133,6 +133,7 @@ struct DirectSettingsView: View {
                     Router.shared.contactsPath = .init()
                 }
             }
+            .accessibilityIdentifier("confirmRemoveFriend")
         }
     }
 
@@ -140,7 +141,7 @@ struct DirectSettingsView: View {
         Button(action: run) {
             VStack(spacing: 4) {
                 Image(systemName: icon).font(.system(size: 18))
-                Text(title).font(.system(size: 12))
+                Text(title).font(Fonts.sized(12))
             }
             .foregroundStyle(Theme.accent)
             .frame(width: 84, height: 58)

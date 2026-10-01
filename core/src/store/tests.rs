@@ -57,7 +57,7 @@ fn migrations_by_user_version() {
     {
         let s = Store::open(&p, key()).unwrap();
         assert_eq!(user_version(&s.conn()).unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
         assert_eq!(s.friend_ids().unwrap(), vec!["old-friend"], "旧数据应保留");
     }
 
@@ -453,7 +453,7 @@ fn migrate_v3_to_v4_backfills_sort_ts() {
     let cipher = DbCipher::new(&[9u8; 32]).unwrap();
     old_v3_db(&p, &cipher);
     let s = Store::open(&p, cipher.clone()).unwrap();
-    assert_eq!(user_version(&s.conn()).unwrap(), 4);
+    assert_eq!(user_version(&s.conn()).unwrap(), SCHEMA_VERSION);
     let sort = |id: &str| s.get_message(id).unwrap().unwrap().sort_ts;
     assert_eq!(sort("out-sent"), 1000, "已发送：回填为服务端时间");
     assert_eq!(sort("out-failed"), 1025, "失败的消息没有 server_ts，保持本地时间");
@@ -477,14 +477,15 @@ fn migrate_v3_to_v4_backfills_sort_ts() {
     assert!(matches!(s.get_message("text").unwrap().unwrap().msg.body, StoredBody::Text { ref text } if text == "旧消息"));
     assert_eq!(s.friend_ids().unwrap(), vec!["bob"]);
     let c = s.get_conv("u:bob").unwrap().unwrap();
-    assert_eq!((c.last_ts, c.unread, c.pinned, c.muted, c.unread_mentions), (100, 2, true, true, 0));
+    // 未读数按消息表实时统计（v5 / A10）：这个旧库的 u:bob 下有 6 条 read=0 的收到消息（旧计数列写的是 2）
+    assert_eq!((c.last_ts, c.unread, c.pinned, c.muted, c.unread_mentions), (100, 6, true, true, 0));
     assert!(c.draft.is_none());
     assert!(!s.get_message("in-1").unwrap().unwrap().mentions_me);
     s.set_draft("u:bob", Some("草稿"), 5).unwrap();
     assert_eq!(s.get_draft("u:bob").unwrap().as_deref(), Some("草稿"));
     drop(s);
     let s = Store::open(&p, cipher).unwrap();
-    assert_eq!(user_version(&s.conn()).unwrap(), 4, "再次打开不重复迁移");
+    assert_eq!(user_version(&s.conn()).unwrap(), SCHEMA_VERSION, "再次打开不重复迁移");
     assert_eq!(s.get_draft("u:bob").unwrap().as_deref(), Some("草稿"));
 }
 
@@ -616,4 +617,282 @@ fn delete_conversation_store() {
     s.delete_conversation("g:x").unwrap();
     s.ensure_conv("g:x", 0).unwrap();
     assert!(!s.get_conv("g:x").unwrap().unwrap().muted);
+}
+
+/// 构造一个 v4 的旧库（2026-09-30 审查修复之前的版本）：在 v3 旧库上执行 v4 迁移，再按 v4 的表结构写入
+/// 这次迁移要处理的数据。
+fn old_v4_db(p: &Path, cipher: &DbCipher) -> String {
+    old_v3_db(p, cipher);
+    let mut c = Connection::open(p).unwrap();
+    migrate_with(&mut c, &MIGRATIONS[..4], cipher).unwrap();
+    assert_eq!(user_version(&c).unwrap(), 4);
+    let insert = |id: &str, conv: &str, read: i64, body: serde_json::Value| {
+        let blob = cipher.seal(LABEL_BODY, &serde_json::to_vec(&body).unwrap());
+        c.execute(
+            "INSERT INTO messages(id,conv_id,sender_id,outgoing,sent_at,server_ts,sort_ts,status,body,read) VALUES(?1,?2,'x',0,1,1,?3,'delivered',?4,?5)",
+            params![id, conv, 5000 + c.last_insert_rowid(), blob, read],
+        )
+        .unwrap();
+    };
+    let att = |local: serde_json::Value| {
+        serde_json::json!({"body":{"t":"attachments","items":[{"id":"a","key":"k","digest":"d","size":3,"mime":"","file_name":"x.jpg",
+            "kind":"image","width":0,"height":0,"duration_ms":0,"thumbnail":"dGh1bWI=","format":2,"local_path":local}],"caption":null},"quote":null})
+    };
+    // A2：旧版本处理 from 为空的信封后留下的坏会话，连同占位消息、回应、草稿
+    c.execute("INSERT INTO conversations(conv_id,last_ts,unread) VALUES('u:',7,1)", []).unwrap();
+    insert("bad-1", "u:", 0, serde_json::json!({"body":{"t":"undecryptable"},"quote":null}));
+    c.execute("INSERT INTO reactions(message_id,user_id,emoji,ts) VALUES('bad-1','x','👍',1)", []).unwrap();
+    c.execute("INSERT INTO drafts(conv_id,text,updated_at) VALUES('u:',x'00',1)", []).unwrap();
+    // C5：有 / 没有本地文件的附件消息
+    c.execute("INSERT INTO conversations(conv_id,last_ts,unread) VALUES('u:carol',9000,1)", []).unwrap();
+    insert("att-local", "u:carol", 1, att(serde_json::json!("/data/files/abc_0_x.jpg")));
+    insert("att-remote", "u:carol", 1, att(serde_json::Value::Null));
+    insert("unread-1", "u:carol", 0, serde_json::json!({"body":{"t":"text","text":"真的未读"},"quote":null}));
+    // A6：被极端 server_ts 顶到未来的会话
+    c.execute("INSERT INTO conversations(conv_id,last_ts) VALUES('u:future',4102444800000)", []).unwrap();
+    // A8：已有的入站会话；挂起的群消息
+    let mut out = megolm::new_outbound();
+    let inbound = megolm::inbound_from_key(&megolm::export_key(&out)).unwrap();
+    c.execute(
+        "INSERT INTO megolm_in(sender,session_id,group_id,pickle) VALUES('alice',?1,'g1',?2)",
+        params![out.session_id(), megolm::pickle_inbound(&inbound, cipher.pickle_key())],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO megolm_pending(envelope_id,group_id,sender,session_id,body,server_ts,received_at) VALUES('p1','g1','alice','s9','b',1,1)",
+        [],
+    )
+    .unwrap();
+    crate::util::b64e(megolm::encrypt(&mut out, b"m0"))
+}
+
+/// v4 → v5（2026-09-30 审查修复）：旧库打开后数据完好；坏会话被清理；`has_files` 回填；未读数与旧计数一致；
+/// 新索引建立；入站会话可用并开始记录已处理序号；极端会话时间被拉回。
+#[test]
+fn migrate_v4_to_v5_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("db.sqlite");
+    let cipher = DbCipher::new(&[9u8; 32]).unwrap();
+    let m0 = old_v4_db(&p, &cipher);
+    let s = Store::open(&p, cipher.clone()).unwrap();
+    assert_eq!(user_version(&s.conn()).unwrap(), 5);
+
+    // A2：坏会话及其消息、回应、草稿都清掉；会话列表可读
+    assert!(s.get_conv("u:").unwrap().is_none());
+    assert!(s.get_message("bad-1").unwrap().is_none());
+    assert!(s.reactions("bad-1").unwrap().is_empty());
+    let convs: Vec<String> = s.list_convs().unwrap().into_iter().map(|c| c.conv_id).collect();
+    assert_eq!(convs.len(), 4, "{convs:?}");
+    assert!(convs.iter().all(|c| valid_conv_id(c)));
+
+    // 原有数据完好（消息正文、好友、会话标记、排序）
+    assert!(matches!(s.get_message("text").unwrap().unwrap().msg.body, StoredBody::Text { ref text } if text == "旧消息"));
+    assert_eq!(s.friend_ids().unwrap(), vec!["bob"]);
+    let ids: Vec<String> = s.messages("g:g1", None, 50).unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec!["out-sent", "in-1", "in-2", "out-failed", "tie-a", "tie-b", "tie-c"]);
+    let bob = s.get_conv("u:bob").unwrap().unwrap();
+    assert!(bob.pinned && bob.muted);
+
+    // C5：has_files 只标在有本地文件的那条上
+    let with_files: Vec<String> = s.messages_with_files("u:carol").unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(with_files, vec!["att-local"]);
+    assert!(s.messages_with_files("g:g1").unwrap().is_empty());
+    match &s.get_message("att-local").unwrap().unwrap().msg.body {
+        StoredBody::Attachments { items, .. } => assert_eq!(items[0].local_path.as_deref(), Some("/data/files/abc_0_x.jpg")),
+        other => panic!("{other:?}"),
+    }
+
+    // A10：未读数实时统计，与旧计数一致（旧计数为 0 的会话不会凭空多出未读）
+    assert_eq!(s.get_conv("u:carol").unwrap().unwrap().unread, 1);
+    assert_eq!(s.get_conv("g:g1").unwrap().unwrap().unread, 0);
+    s.delete_message("unread-1").unwrap();
+    assert_eq!(s.get_conv("u:carol").unwrap().unwrap().unread, 0, "删掉未读消息后回落");
+
+    // A6：会话时间拉回当前
+    assert!(s.get_conv("u:future").unwrap().unwrap().last_ts <= crate::util::now_ms() + 1000);
+
+    // 新索引
+    for idx in ["messages_unread", "messages_files", "megolm_pending_key"] {
+        let n: i64 = s.conn().query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [idx], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "{idx}");
+    }
+
+    // A8：旧的入站会话仍可解密，并从此记录已处理的序号；同一序号第二次被拒绝
+    let sid: String = s.conn().query_row("SELECT session_id FROM megolm_in WHERE sender='alice'", [], |r| r.get(0)).unwrap();
+    let (gid, mut sess) = s.get_inbound("alice", &sid).unwrap().unwrap();
+    assert_eq!(gid, "g1");
+    let (plain, index) = megolm::decrypt_detailed(&mut sess, &crate::util::b64d(&m0).unwrap()).unwrap();
+    assert_eq!((plain.as_slice(), index), (&b"m0"[..], 0));
+    let saved = InboxPlain { plaintext: "bTA=".into(), olm_session_id: None };
+    assert!(s.save_inbound_decrypt("alice", "g1", &sess, "env", &saved, index).unwrap());
+    assert!(!s.save_inbound_decrypt("alice", "g1", &sess, "env2", &saved, index).unwrap(), "重放的序号");
+    // 更早的 room_key 替换会话时保留已处理序号
+    s.save_inbound("alice", "g1", &sess).unwrap();
+    assert!(!s.save_inbound_decrypt("alice", "g1", &sess, "env3", &saved, index).unwrap());
+    assert_eq!(s.pending_for("alice", "s9").unwrap().len(), 1);
+
+    drop(s);
+    let s = Store::open(&p, cipher).unwrap();
+    assert_eq!(user_version(&s.conn()).unwrap(), 5, "再次打开不重复迁移");
+    assert_eq!(s.messages_with_files("u:carol").unwrap().len(), 1);
+}
+
+/// A8：已处理序号的区间表示。
+#[test]
+fn megolm_index_set() {
+    use super::sessions::IndexSet;
+    let mut s = IndexSet::parse("");
+    for i in [0u32, 1, 2, 5, 4, 9] {
+        assert!(s.insert(i));
+    }
+    assert!(!s.insert(1) && !s.insert(5));
+    assert_eq!(s.encode(), "0-2,4-5,9");
+    assert!(s.insert(3));
+    assert_eq!(s.encode(), "0-5,9");
+    assert_eq!(IndexSet::parse(&s.encode()), s);
+    assert!(s.contains(9) && !s.contains(8));
+    // 区间过多时合并最小的两个（空洞视为已处理），不会无限增长
+    let mut many = IndexSet::parse("");
+    for i in 0..200u32 {
+        many.insert(i * 2);
+    }
+    assert!(many.encode().split(',').count() <= 64);
+    assert!(many.contains(398) && many.contains(1));
+    assert!(IndexSet::parse("junk,3-1,7").contains(7));
+}
+
+/// A3：`modify_message` 在库锁内读出最新的行再写回；只写变化的列；正文读不出来的行不会被占位覆盖。
+#[test]
+fn modify_message_is_atomic_and_column_level() {
+    let s = store();
+    s.ensure_conv("u:bob", 0).unwrap();
+    s.insert_message(&mut row("m1", "原文", 10)).unwrap();
+    // 先读出一份旧的行，随后别处把它撤回
+    let stale = s.get_message("m1").unwrap().unwrap();
+    s.modify_message("m1", |r| {
+        r.deleted = true;
+        r.msg = StoredMessage::plain(StoredBody::System { text: "此消息已撤回".into() }, None);
+        true
+    })
+    .unwrap()
+    .unwrap();
+    // 基于库里最新状态修改：看到的是已撤回的行，而不是手里那份旧的
+    let after = s
+        .modify_message("m1", |r| {
+            assert!(r.deleted, "闭包拿到的是最新的行");
+            r.read = true;
+            r.status = MessageStatus::Read;
+            true
+        })
+        .unwrap()
+        .unwrap();
+    assert!(after.deleted && after.read);
+    assert!(!stale.deleted);
+    let m = s.get_message("m1").unwrap().unwrap();
+    assert!(m.deleted && matches!(m.msg.body, StoredBody::System { .. }));
+    // 返回 false：不写
+    assert!(s.modify_message("m1", |r| { r.deleted = false; false }).unwrap().is_none());
+    assert!(s.get_message("m1").unwrap().unwrap().deleted);
+    assert!(s.modify_message("nope", |_| true).unwrap().is_none());
+    // 正文损坏的行：只改状态列，密文保持原样（之后若能恢复不会被占位覆盖）
+    s.insert_message(&mut row("m2", "x", 20)).unwrap();
+    s.conn().execute("UPDATE messages SET body=x'00010203' WHERE id='m2'", []).unwrap();
+    s.modify_message("m2", |r| { r.read = true; true }).unwrap().unwrap();
+    assert_eq!(s.raw_message_body("m2").unwrap().unwrap(), vec![0u8, 1, 2, 3]);
+    assert!(s.get_message("m2").unwrap().unwrap().read);
+}
+
+/// C1：同一时间戳连续插入——每条的排序时间仍然唯一、顺序与到达顺序一致，翻页不漏不重；代价有上限。
+#[test]
+fn same_ts_inserts_stay_unique_and_ordered() {
+    let s = store();
+    s.ensure_conv("u:bob", 0).unwrap();
+    s.insert_message(&mut row("later", "之后的消息", 9_000)).unwrap();
+    let n = 300;
+    for i in 0..n {
+        assert!(s.insert_message(&mut row(&format!("m{i}"), "同一毫秒", 5_000)).unwrap());
+    }
+    let all = s.messages("u:bob", None, 1000).unwrap();
+    assert_eq!(all.len(), n + 1);
+    assert!(all.windows(2).all(|w| w[0].sort_ts < w[1].sort_ts), "sort_ts 唯一");
+    let order: Vec<&str> = all.iter().filter(|m| m.id != "later").map(|m| m.id.as_str()).collect();
+    let want: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+    assert_eq!(order, want.iter().map(|s| s.as_str()).collect::<Vec<_>>(), "同一毫秒的消息保持到达顺序");
+    // 前 32 条紧挨着原时间戳；再多就排到会话末尾
+    assert_eq!(s.get_message("m0").unwrap().unwrap().sort_ts, 5_000);
+    assert_eq!(s.get_message("m31").unwrap().unwrap().sort_ts, 5_031);
+    assert!(s.get_message("m32").unwrap().unwrap().sort_ts > 9_000);
+    let mut got = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = s.messages("u:bob", cursor, 7).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = Some(page[0].sort_ts);
+        got.splice(0..0, page.into_iter().map(|m| m.id));
+    }
+    assert_eq!(got, all.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), "翻页不漏不重");
+    // A6：极端时间戳不溢出
+    let mut a = row("max1", "x", i64::MAX);
+    let mut b2 = row("max2", "x", i64::MAX);
+    s.insert_message(&mut a).unwrap();
+    s.insert_message(&mut b2).unwrap();
+    assert!(a.sort_ts < b2.sort_ts && b2.sort_ts < crate::util::now_ms() + MAX_FUTURE_MS + 10);
+    assert_eq!(s.messages("u:bob", None, 2).unwrap().last().unwrap().id, "max2");
+}
+
+/// C2：搜索只比对文字正文、附件说明与文件名；够 limit 条即停；结果从新到旧。
+#[test]
+fn search_streams_and_limits() {
+    let s = store();
+    s.ensure_conv("u:bob", 0).unwrap();
+    for i in 0..1200 {
+        s.insert_message(&mut row(&format!("t{i}"), &format!("第 {i} 条 Keyword 消息"), 1_000 + i)).unwrap();
+    }
+    let att = |id: &str, ts: i64, name: &str, caption: Option<&str>| {
+        let mut r = row(id, "", ts);
+        r.msg = StoredMessage::plain(
+            StoredBody::Attachments {
+                items: vec![StoredAttachment {
+                    wire: WireAttachment {
+                        id: "a".into(),
+                        key: "keyword-in-key".into(),
+                        digest: "d".into(),
+                        size: 1,
+                        mime: "image/jpeg".into(),
+                        file_name: name.into(),
+                        kind: AttachmentKind::Image,
+                        width: 0,
+                        height: 0,
+                        duration_ms: 0,
+                        thumbnail: Some("a2V5d29yZA==".into()),
+                        format: 2,
+                    },
+                    local_path: None,
+                }],
+                caption: caption.map(|c| c.to_string()),
+            },
+            None,
+        );
+        r
+    };
+    s.insert_message(&mut att("a-name", 5_000, "报告 Final.pdf", None)).unwrap();
+    s.insert_message(&mut att("a-cap", 5_001, "x.jpg", Some("合影 final 版"))).unwrap();
+    s.insert_message(&mut att("a-none", 5_002, "y.jpg", None)).unwrap();
+    let mut sys = row("sys", "", 5_003);
+    sys.msg = StoredMessage::plain(StoredBody::System { text: "final 系统提示".into() }, None);
+    s.insert_message(&mut sys).unwrap();
+    let mut del = row("del", "已撤回 final", 5_004);
+    del.deleted = true;
+    s.insert_message(&mut del).unwrap();
+
+    let hits = s.search_messages("keyword", 200).unwrap();
+    assert_eq!(hits.len(), 200, "够 200 条即停");
+    assert_eq!(hits[0].id, "t1199");
+    assert!(hits.windows(2).all(|w| w[0].sort_ts > w[1].sort_ts), "从新到旧");
+    let ids: Vec<String> = s.search_messages("final", 200).unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec!["a-cap", "a-name"], "附件只比对说明与文件名；系统提示与已撤回的不参与");
+    assert!(s.search_messages("[图片]", 200).unwrap().is_empty(), "不再匹配类型占位文字");
+    assert!(s.search_messages("a2v5", 200).unwrap().is_empty(), "缩略图、密钥不参与搜索");
 }

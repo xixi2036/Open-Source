@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -29,8 +30,8 @@ func TestQueueQuota(t *testing.T) {
 
 	var sr sendResp
 	msgs := []map[string]any{}
-	for i := 0; i < 6; i++ {
-		msgs = append(msgs, map[string]any{"to": b.ID, "type": 1, "body": "eA==", "client_id": "c"})
+	for i := 0; i < 7; i++ {
+		msgs = append(msgs, map[string]any{"to": b.ID, "type": 1, "body": "eA==", "client_id": fmt.Sprint("c", i)})
 	}
 	a.must("POST", "/v1/messages", map[string]any{"messages": msgs}, &sr)
 	ok, full := 0, 0
@@ -44,8 +45,8 @@ func TestQueueQuota(t *testing.T) {
 			t.Fatalf("意外错误: %+v", r)
 		}
 	}
-	if ok != 5 || full != 1 {
-		t.Fatalf("b 队列上限 6（已有 1 个事件）：应成功 5、拒收 1，得到 %d/%d", ok, full)
+	if ok != 6 || full != 1 {
+		t.Fatalf("b 队列上限 6 条信封（已有的事件不占用信封配额）：应成功 6、拒收 1，得到 %d/%d", ok, full)
 	}
 
 	// 群消息：b 已满被跳过，c 正常收到；事件（group_updated）不受配额限制
@@ -58,17 +59,27 @@ func TestQueueQuota(t *testing.T) {
 		t.Fatalf("c 应收到群消息: %+v", inbox.Messages)
 	}
 	b.must("GET", "/v1/messages?limit=500", nil, &inbox)
-	if len(inbox.Messages) != 5 {
+	if len(inbox.Messages) != 6 {
 		t.Fatalf("b 不应再收到群消息: %d", len(inbox.Messages))
 	}
-	gotGroupEvent := false
+	gotGroupEvent, rejected := false, 0
 	for _, ev := range inbox.Events {
-		if ev["type"] == "group_updated" {
+		switch ev["type"] {
+		case "group_updated":
 			gotGroupEvent = true
+		case "messages_rejected":
+			rejected++
+			if ev["reason"] != "queue_full" {
+				t.Fatalf("messages_rejected 应带 reason=queue_full: %v", ev)
+			}
 		}
 	}
 	if !gotGroupEvent {
 		t.Fatal("事件不受队列配额限制")
+	}
+	// A2：队列满时给接收方留一条合并的「有消息被拒」事件（单聊被拒一次、群消息被跳过一次，合并后只有一条）
+	if rejected != 1 {
+		t.Fatalf("应恰好有 1 条 messages_rejected 事件，得到 %d: %v", rejected, inbox.Events)
 	}
 
 	// ack 之后腾出空间

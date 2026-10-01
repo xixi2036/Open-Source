@@ -6,6 +6,11 @@ import com.hush.app.util.net
 import android.content.Context
 import android.os.Build
 import com.hush.app.util.HushLog as Log
+import android.util.Log as AndroidLog
+import com.hush.app.BuildConfig
+import uniffi.hushcore.LogLevel
+import uniffi.hushcore.LogListener
+import uniffi.hushcore.setLogListener
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -41,8 +46,29 @@ object HushCore {
     /** 应用级协程作用域（进程存活期间）。 */
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private val _events = MutableSharedFlow<CoreEvent>(extraBufferCapacity = 512, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    // B13：缓冲满时不再悄悄丢最旧的事件。tryEmit 失败（最慢的订阅者积压了 1024 条）时记下“有事件丢失”，
+    // 由 [resync] 通知各页面从核心重新读取当前状态自愈。
+    private val _events = MutableSharedFlow<CoreEvent>(extraBufferCapacity = 1024, onBufferOverflow = BufferOverflow.SUSPEND)
     val events: SharedFlow<CoreEvent> = _events
+
+    private val eventsLost = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val _resync = MutableStateFlow(0)
+    /** 每次递增表示“事件流丢过事件”：订阅方应从核心重新加载（会话列表、聊天页最新一页、好友与申请）。 */
+    val resync: StateFlow<Int> = _resync
+
+    private suspend fun resyncLoop() {
+        while (true) {
+            kotlinx.coroutines.delay(1000)
+            if (eventsLost.compareAndSet(true, false)) {
+                Log.w(TAG, "event bus overflowed, asking screens to resync")
+                _resync.value++
+                if (isLoggedIn) {
+                    scope.launch(Dispatchers.IO) { runCatching { ContactsStore.reloadLocalFriends() } }
+                    scope.launch(Dispatchers.IO) { runCatching { ContactsStore.refreshRequests() } }
+                }
+            }
+        }
+    }
 
     private val _connection = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connection: StateFlow<ConnectionState> = _connection
@@ -89,6 +115,8 @@ object HushCore {
         scope.launch { dispatchSideEffects() }
         scope.launch { connectionWatchdog() }
         scope.launch { fallbackPoller() }
+        scope.launch { resyncLoop() }
+        NetworkMonitor.start(appContext) { onNetworkAvailable() }
         openInBackground()
     }
 
@@ -108,6 +136,7 @@ object HushCore {
 
     @Synchronized private fun open() {
         if (_ready.value) return
+        installCoreLogging()
         val dir = File(appContext.filesDir, "hush")
         val key = DbKeyStore.loadOrCreate(appContext)
         client = openClient(dir, key)
@@ -120,7 +149,11 @@ object HushCore {
                         lastConnChange = System.currentTimeMillis()
                         if (event.state == ConnectionState.DISCONNECTED) recordDrop(lastConnChange)
                     }
-                    _events.tryEmit(event)
+                    if (!_events.tryEmit(event)) {
+                        eventsLost.set(true)
+                        // 被动登出与通话信令不能丢：改为挂起投递（不阻塞核心的回调线程）
+                        if (event is CoreEvent.LoggedOut || event is CoreEvent.CallSignalReceived) scope.launch { _events.emit(event) }
+                    }
                 } catch (t: Throwable) {
                     Log.w(TAG, "onEvent", t)
                 }
@@ -159,6 +192,24 @@ object HushCore {
     }
 
     private const val OPEN_ATTEMPTS = 3
+
+    /**
+     * 核心库日志转到 Logcat（tag "hushcore"）。核心保证日志里不含消息明文、密钥与 token；
+     * debug 构建转发全部级别，release 只转发 warn 与 error。
+     */
+    private fun installCoreLogging() {
+        setLogListener(object : LogListener {
+            override fun onLog(level: LogLevel, module: String, message: String) {
+                val text = "[$module] $message"
+                when (level) {
+                    LogLevel.ERROR -> AndroidLog.e("hushcore", text)
+                    LogLevel.WARN -> AndroidLog.w("hushcore", text)
+                    LogLevel.INFO -> if (BuildConfig.DEBUG) AndroidLog.i("hushcore", text)
+                    LogLevel.DEBUG -> if (BuildConfig.DEBUG) AndroidLog.d("hushcore", text)
+                }
+            }
+        })
+    }
 
     /**
      * U1 迁移：v3 之前“删除”的会话只是被 App 隐藏（消息已清空、会话行还在）。
@@ -206,12 +257,27 @@ object HushCore {
     private suspend fun connectionWatchdog() {
         while (true) {
             kotlinx.coroutines.delay(10_000)
-            if (!isLoggedIn || !started) continue
             val idle = System.currentTimeMillis() - lastConnChange
-            if (_connection.value == ConnectionState.DISCONNECTED && idle > 45_000 && appInForeground) {
+            // B2：不再要求应用在前台（后台被挤下线后只有这里能把 WS 循环拉起来）
+            if (ConnectionPolicy.shouldRestart(isLoggedIn, started, _connection.value == ConnectionState.DISCONNECTED, idle, NetworkMonitor.online.value)) {
                 Log.i(TAG, "watchdog: restart connection")
                 lastConnChange = System.currentTimeMillis()
                 runCatching { client.start() }
+            }
+        }
+    }
+
+    /**
+     * 系统网络恢复 / 切换（B2）：立即确保 WS 循环在运行并用 HTTP 补拉一次积压。
+     * 设备可能正要休眠，用一个限时 WakeLock 保证这次补拉能跑完（B3）。
+     */
+    private fun onNetworkAvailable() {
+        if (!::client.isInitialized || !isLoggedIn || !started) return
+        scope.launch(Dispatchers.IO) {
+            KeepAlive.withWakeLock(appContext, "net-restore", 15_000) {
+                lastConnChange = System.currentTimeMillis()
+                runCatching { client.start() }
+                runCatching { client.syncNow() }
             }
         }
     }
@@ -231,7 +297,7 @@ object HushCore {
 
     /**
      * HTTP 兜底补拉：通话建立期间每 1.5 秒一次；前台且 WS 未连接时每 5 秒一次；
-     * 前台且网络不稳定（WS 频繁掉线，可能处于假连接）时每 3 秒一次。
+     * 前台且网络不稳定（WS 频繁掉线，可能处于假连接）时每 3 秒一次；后台且 WS 未连接时每 30 秒一次（B2）。
      * （模拟器网络会回收空闲连接，WS 周期性掉线，见 docs/issues/android.md 第 6 条。）
      */
     private suspend fun fallbackPoller() {
@@ -240,12 +306,14 @@ object HushCore {
             kotlinx.coroutines.delay(1500)
             if (!isLoggedIn || !started) continue
             val now = System.currentTimeMillis()
-            val due = when {
-                fastSync -> true
-                appInForeground && _connection.value != ConnectionState.CONNECTED -> now - last >= 5000
-                appInForeground && networkUnstable(now) -> now - last >= 3000
-                else -> false
-            }
+            val due = ConnectionPolicy.pollDue(
+                fastSync = fastSync,
+                foreground = appInForeground,
+                connected = _connection.value == ConnectionState.CONNECTED,
+                unstable = networkUnstable(now),
+                online = NetworkMonitor.online.value,
+                sinceLastMs = now - last,
+            )
             if (due) {
                 last = now
                 runCatching { client.syncNow() }
@@ -277,6 +345,7 @@ object HushCore {
         ContactsStore.clear()
         MomentNotifStore.clear()
         MediaCache.clear()
+        com.hush.app.service.Notifier.cancelAllMessages(appContext)
         // 发送用的临时明文副本（cacheDir/outgoing、voice）
         MediaUtils.clearTemp(appContext)
     }

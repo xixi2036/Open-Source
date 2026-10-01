@@ -12,7 +12,8 @@ private fun Throwable.describe(): String = when (this) {
     is HushException.Network -> "网络连接失败，请检查服务器地址"
     is HushException.Server -> message.ifBlank { code }
     is HushException.NotLoggedIn -> "请先登录"
-    is HushException.InvalidInput -> "输入不合法：$message"
+    // 公网 http 地址被核心拒绝时，核心文案本身已说明原因（只有本机与内网允许 http）
+    is HushException.InvalidInput -> if (message.contains("https")) message else "输入不合法：$message"
     is HushException.NotFound -> "未找到：$message"
     is HushException.Crypto -> "加密出错：$message"
     is HushException.Storage -> "存储出错：$message"

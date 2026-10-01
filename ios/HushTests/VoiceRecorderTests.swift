@@ -1,11 +1,21 @@
 import XCTest
 @testable import Hush
 
+/// 不碰真实音频会话与麦克风的录音后端：模拟"没有麦克风"，录音结束时由录音器生成静音文件
+@MainActor
+private final class FakeVoiceCapture: VoiceCaptureBackend {
+    private(set) var begins = 0
+    private(set) var ends = 0
+    func begin(url: URL) -> Bool { begins += 1; return false }
+    func end() { ends += 1 }
+}
+
 @MainActor
 final class VoiceRecorderTests: XCTestCase {
     private func makeRecorder() -> VoiceRecorder {
         let r = VoiceRecorder()
         r.permission = { .granted }
+        r.backend = FakeVoiceCapture()
         return r
     }
 
@@ -63,6 +73,7 @@ final class VoiceRecorderTests: XCTestCase {
     func testDeniedPermissionDoesNotRecord() {
         let r = VoiceRecorder()
         r.permission = { .denied }
+        r.backend = FakeVoiceCapture()
         r.pressChanged(translationY: 0)
         XCTAssertFalse(r.isRecording)
         XCTAssertNil(r.pressEnded())

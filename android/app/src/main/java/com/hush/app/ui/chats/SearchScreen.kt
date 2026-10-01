@@ -68,7 +68,10 @@ fun SearchScreen(onBack: () -> Unit, onOpen: (String) -> Unit, onOpenMessage: (c
         if (query.isEmpty()) { convs = emptyList(); msgs = emptyList(); return@LaunchedEffect }
         delay(250)
         convs = allConvs.filter { it.title.contains(query, ignoreCase = true) }
-        msgs = withContext(Dispatchers.IO) { runCatching { HushCore.client.searchMessages(query) }.getOrDefault(emptyList()) }
+        // 核心的异步搜索：输入变化时 LaunchedEffect 取消协程，正在进行的搜索随之取消
+        msgs = runCatching { HushCore.client.searchMessagesAsync(query) }
+            .onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }
+            .getOrDefault(emptyList())
     }
     val titles = remember(allConvs) { allConvs.associateBy { it.id } }
     Column(Modifier.fillMaxSize().background(Hush.colors.background)) {

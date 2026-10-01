@@ -1,5 +1,7 @@
 package com.hush.app.ui.chat
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.hush.app.util.Savers
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -65,13 +67,14 @@ private data class ForwardTarget(val convId: String, val title: String, val seed
  * 部分目标发送失败时列出失败的会话，可一键重发（失败的那条在目标会话里也显示为失败，可单独重发）。
  */
 @Composable
-fun ForwardDialog(m: MessageItem, vm: ChatViewModel, onDismiss: () -> Unit) {
+fun ForwardDialog(messages: List<MessageItem>, vm: ChatViewModel, onSent: () -> Unit = {}, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val friends by ContactsStore.friends.collectAsState()
     var convTargets by remember { mutableStateOf(emptyList<ForwardTarget>()) }
-    var q by remember { mutableStateOf("") }
-    var selected by remember { mutableStateOf(linkedSetOf<String>()) }
+    // A4：搜索词与已选目标可跨 Activity 重建保留
+    var q by rememberSaveable { mutableStateOf("") }
+    var selected by rememberSaveable(stateSaver = Savers.OrderedStringSet) { mutableStateOf(linkedSetOf<String>()) }
     var busy by remember { mutableStateOf(false) }
     var failed by remember { mutableStateOf(emptyList<MessageItem>()) }
 
@@ -94,12 +97,12 @@ fun ForwardDialog(m: MessageItem, vm: ChatViewModel, onDismiss: () -> Unit) {
         if (selected.isEmpty() || busy) return
         busy = true
         scope.launch {
-            val out = vm.forward(m, selected.toList())
+            val out = vm.forwardMany(messages, selected.toList())
             busy = false
             if (out == null) return@launch
             val bad = out.filter { it.status == MessageStatus.FAILED }
             if (bad.isEmpty()) {
-                Toast.makeText(context, "已转发", Toast.LENGTH_SHORT).show(); onDismiss()
+                Toast.makeText(context, "已转发", Toast.LENGTH_SHORT).show(); onSent(); onDismiss()
             } else failed = bad
         }
     }
@@ -107,7 +110,7 @@ fun ForwardDialog(m: MessageItem, vm: ChatViewModel, onDismiss: () -> Unit) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         DebugTextSink { q = it }
         Column(Modifier.fillMaxSize().background(Hush.colors.background).statusBarsPadding().imePadding()) {
-            HushTopBar("选择会话", onBack = onDismiss, actions = {
+            HushTopBar(if (messages.size > 1) "转发 ${messages.size} 条消息" else "选择会话", onBack = onDismiss, actions = {
                 TextButton(enabled = selected.isNotEmpty() && !busy, onClick = ::send, modifier = Modifier.testTag("forward_send")) {
                     Text(if (selected.isEmpty()) "发送" else "发送(${selected.size})")
                 }
@@ -142,7 +145,7 @@ fun ForwardDialog(m: MessageItem, vm: ChatViewModel, onDismiss: () -> Unit) {
     if (failed.isNotEmpty()) {
         val names = failed.joinToString("、") { titles[it.convId] ?: "会话" }
         AlertDialog(
-            onDismissRequest = { failed = emptyList(); onDismiss() },
+            onDismissRequest = { failed = emptyList(); onSent(); onDismiss() },
             title = { Text(if (failed.size >= selected.size) "转发失败" else "部分转发失败") },
             text = { Text("以下会话发送失败：$names\n可以现在重发，或稍后在对应会话中点击失败图标重发。") },
             confirmButton = {
@@ -152,12 +155,12 @@ fun ForwardDialog(m: MessageItem, vm: ChatViewModel, onDismiss: () -> Unit) {
                         val again = vm.resendAll(failed).filter { it.status == MessageStatus.FAILED }
                         busy = false
                         if (again.isEmpty()) {
-                            Toast.makeText(context, "已转发", Toast.LENGTH_SHORT).show(); failed = emptyList(); onDismiss()
+                            Toast.makeText(context, "已转发", Toast.LENGTH_SHORT).show(); failed = emptyList(); onSent(); onDismiss()
                         } else failed = again
                     }
                 }) { Text("重发", color = Hush.colors.accent) }
             },
-            dismissButton = { TextButton(onClick = { failed = emptyList(); onDismiss() }) { Text("关闭") } },
+            dismissButton = { TextButton(onClick = { failed = emptyList(); onSent(); onDismiss() }) { Text("关闭") } },
         )
     }
 }

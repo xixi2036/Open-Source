@@ -13,8 +13,11 @@
     <string name="ch_connection_desc">保持与服务器的连接</string>
 
     <!-- 通知内容（为保护隐私不显示消息正文） -->
-    <string name="notif_new_message">来自 %1$s 的新消息</string>
-    <string name="notif_mentioned">%1$s 中有人@了你</string>
+    <string name="notif_me">我</string>
+    <string name="notif_summary">有新消息</string>
+    <string name="notif_action_mark_read">标为已读</string>
+    <string name="notif_action_reply">回复</string>
+    <string name="notif_reply_failed">回复未能发出，请打开 Hush 重试</string>
     <string name="notif_incoming_voice">语音来电</string>
     <string name="notif_incoming_video">视频来电</string>
     <string name="notif_call_accept">接听</string>

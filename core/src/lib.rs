@@ -12,6 +12,7 @@ mod client;
 pub(crate) mod content;
 pub(crate) mod crypto;
 pub mod error;
+pub mod logging;
 pub(crate) mod store;
 pub mod types;
 pub(crate) mod util;
@@ -21,6 +22,7 @@ use std::future::Future;
 use std::sync::{Arc, LazyLock};
 
 pub use error::{HushError, Result};
+pub use logging::{set_log_listener, LogLevel, LogListener};
 pub use types::*;
 
 use client::{direct_conv, Inner};
@@ -81,6 +83,13 @@ impl HushClient {
 
     pub fn set_listener(&self, listener: Arc<dyn EventListener>) {
         self.inner.set_listener(listener);
+    }
+
+    /// 是否允许对**公网**地址使用明文 http（2026-09-30 / B1，默认 false）。本机与内网地址（127.0.0.1、`10.0.2.2`、
+    /// 192.168.x.x 等）始终允许 http，不需要这个开关；它只给「公网测试服务器还没配证书」这种调试场景用。
+    /// 不持久化，需要的话每次构造后调用。
+    pub fn set_allow_insecure_http(&self, allow: bool) {
+        self.inner.set_allow_insecure_http(allow);
     }
 
     // ================= 账号 =================
@@ -215,6 +224,16 @@ impl HushClient {
 
     pub fn search_messages(&self, query: String) -> Result<Vec<MessageItem>> {
         self.inner.search_messages(&query)
+    }
+
+    /// `search_messages` 的异步版本（2026-09-30 / C2）：在核心的阻塞线程池上执行，不占用调用方线程。
+    /// 结果与同步版本相同（最多 200 条，从新到旧）。
+    pub async fn search_messages_async(&self, query: String) -> Result<Vec<MessageItem>> {
+        let i = self.inner.clone();
+        RUNTIME
+            .spawn_blocking(move || i.search_messages(&query))
+            .await
+            .map_err(|e| HushError::internal(format!("任务异常: {e}")))?
     }
 
     pub async fn send_text(&self, conv_id: String, text: String, quote_id: Option<String>) -> Result<MessageItem> {

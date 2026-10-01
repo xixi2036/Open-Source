@@ -1,5 +1,7 @@
 package com.hush.app.ui.chat
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.hush.app.util.Savers
 import com.hush.app.util.net
 
 import android.widget.Toast
@@ -34,7 +36,7 @@ fun AddMembersScreen(groupId: String, onDone: () -> Unit) {
     val context = LocalContext.current
     val friends by ContactsStore.friends.collectAsState()
     var existing by remember { mutableStateOf(setOf<String>()) }
-    var selected by remember { mutableStateOf(setOf<String>()) }
+    var selected by rememberSaveable(stateSaver = Savers.StringSet) { mutableStateOf(setOf<String>()) }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     LaunchedEffect(groupId) {

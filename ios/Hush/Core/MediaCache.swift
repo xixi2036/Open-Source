@@ -44,5 +44,6 @@ final class MediaCache {
         pendingAvatars = []
         pendingMedia = []
         ImageCache.removeAll()
+        AttachmentFiles.reset()
     }
 }

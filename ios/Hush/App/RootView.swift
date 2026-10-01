@@ -1,17 +1,15 @@
 import SwiftUI
 
-/// 根视图：按登录阶段切换；叠加屏幕锁、后台遮罩、通话页、toast
+/// 根视图：按登录阶段切换。通话页、屏幕锁、后台遮罩、toast 不在这里，而在独立的高层级窗口里
+/// （OverlayWindows），这样它们能盖住任何 sheet / fullScreenCover。
 struct RootView: View {
-    @Environment(\.scenePhase) private var scenePhase
     var core = HushCore.shared
-    var lock = ScreenLock.shared
-    var calls = CallManager.shared
 
     var body: some View {
         ZStack {
             switch core.phase {
             case .launching:
-                Theme.background.ignoresSafeArea()
+                LaunchingView()
             case .loggedOut:
                 AuthFlowView()
             case .needsProfile:
@@ -21,21 +19,32 @@ struct RootView: View {
             case let .failed(msg, keyMismatch):
                 StartupFailedView(message: msg, keyMismatch: keyMismatch)
             }
-            if calls.isPresented && core.phase == .ready {
-                CallView()
-                    .transition(.move(edge: .bottom))
-                    .zIndex(1)
-            }
-            // 屏幕锁与后台遮罩必须盖住通话页：否则应用切换器快照会露出对方画面和昵称。
-            // 设计决定：屏幕锁也覆盖通话页，来电时需先解锁再接听。
-            if lock.locked && core.phase == .ready {
-                LockScreenView().zIndex(2)
-            } else if lock.privacyScreen && scenePhase != .active {
-                PrivacyCoverView().zIndex(2)
-            }
         }
         .tint(Theme.accent)
-        .withToast()
+    }
+}
+
+/// 启动页：数据库在后台线程打开 / 迁移（B1），期间显示进度而不是白屏
+struct LaunchingView: View {
+    /// 很快完成时不闪一下文字：0.4 秒后才显示
+    @State private var showProgress = false
+    var body: some View {
+        ZStack {
+            Theme.background.ignoresSafeArea()
+            VStack(spacing: 18) {
+                Image("Logo").resizable().frame(width: 84, height: 84)
+                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                if showProgress {
+                    ProgressView()
+                    Text("正在准备数据…").font(Fonts.secondary).foregroundStyle(Theme.textSecondary)
+                        .accessibilityIdentifier("launchingText")
+                }
+            }
+        }
+        .task {
+            try? await Task.sleep(for: .milliseconds(400))
+            showProgress = true
+        }
     }
 }
 
@@ -89,13 +98,13 @@ struct LockScreenView: View {
             VStack(spacing: 20) {
                 Image(systemName: "lock.fill").font(.system(size: 44)).foregroundStyle(Theme.accent)
                 Text("Hush 已锁定").font(Fonts.title)
-                Button("解锁") { lock.unlock() }
+                Button("解锁") { lock.unlockManually() }
                     .buttonStyle(PrimaryButtonStyle())
                     .frame(width: 200)
                     .accessibilityIdentifier("unlockButton")
             }
         }
         .ignoresSafeArea()
-        .onAppear { lock.unlock() }
+        .onAppear { hideKeyboard(); lock.autoUnlock() }
     }
 }

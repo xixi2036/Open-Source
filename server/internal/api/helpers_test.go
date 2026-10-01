@@ -57,6 +57,7 @@ func (m *captureMailer) code(email string) string {
 type recordPusher struct {
 	mu    sync.Mutex
 	users []string
+	flush func() // 离线推送是异步的：计数前先等排队中的推送处理完
 }
 
 func (p *recordPusher) Push(userID, reason string) {
@@ -66,6 +67,9 @@ func (p *recordPusher) Push(userID, reason string) {
 }
 
 func (p *recordPusher) count(uid string) int {
+	if p.flush != nil {
+		p.flush()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := 0
@@ -84,6 +88,12 @@ type env struct {
 	st      *store.Store
 	mailer  *captureMailer
 	pusher  *recordPusher
+	hub     *ws.Hub
+}
+
+// wsDial 直接拨号（不经 client.dial 的失败即终止）。
+func wsDial(ctx context.Context, url string) (*websocket.Conn, *http.Response, error) {
+	return websocket.Dial(ctx, url, nil)
 }
 
 var emailSeq atomic.Int64
@@ -102,6 +112,8 @@ func newEnvTimeouts(t *testing.T, withDevCode bool, timeouts *api.Timeouts, opts
 	}
 	e := &env{t: t, st: st, mailer: &captureMailer{codes: map[string]string{}}, pusher: &recordPusher{}}
 	hub := ws.NewHub(st, e.pusher)
+	e.hub = hub
+	e.pusher.flush = hub.FlushPushes
 	cfg := api.Config{
 		Store: st, Hub: hub, Mailer: e.mailer, DataDir: dir,
 		TurnSecret: testTurnSecret, TurnPort: 3478, TurnTTL: time.Hour,

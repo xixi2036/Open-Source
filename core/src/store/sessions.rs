@@ -118,11 +118,6 @@ impl Store {
         self.conn().execute("DELETE FROM olm_sessions WHERE user_id=?1", [uid])?;
         Ok(())
     }
-    pub fn delete_olm_sessions_except(&self, uid: &str, keep_session_id: &str) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM olm_sessions WHERE user_id=?1 AND session_id<>?2", params![uid, keep_session_id])?;
-        Ok(())
-    }
     pub fn has_olm_session(&self, uid: &str) -> Result<bool> {
         Ok(self.conn().query_row("SELECT 1 FROM olm_sessions WHERE user_id=?1 LIMIT 1", [uid], |_| Ok(())).optional()?.is_some())
     }
@@ -200,22 +195,42 @@ impl Store {
         let c = self.conn();
         Self::write_inbound(&c, &self.cipher, sender, gid, s)
     }
+    /// 写入入站会话。已存在时只换 pickle 与群 id，保留 `seen_idx`（已处理的消息序号，A8）。
     fn write_inbound(c: &Connection, cipher: &DbCipher, sender: &str, gid: &str, s: &InboundGroupSession) -> Result<()> {
         let p = megolm::pickle_inbound(s, cipher.pickle_key());
         c.execute(
-            "INSERT OR REPLACE INTO megolm_in(sender,session_id,group_id,pickle) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO megolm_in(sender,session_id,group_id,pickle) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(sender,session_id) DO UPDATE SET group_id=excluded.group_id, pickle=excluded.pickle",
             params![sender, s.session_id(), gid, p],
         )?;
         Ok(())
     }
-    /// 解密群消息后保存入站会话，明文在同一事务写入收件箱（C-H）。
-    pub fn save_inbound_decrypt(&self, sender: &str, gid: &str, s: &InboundGroupSession, env_id: &str, plain: &InboxPlain) -> Result<()> {
+    /// 解密群消息后保存入站会话，明文在同一事务写入收件箱（C-H），并记下该消息序号已处理（A8）。
+    /// 序号此前已处理过（同一密文被重放）时什么都不写，返回 false。
+    pub fn save_inbound_decrypt(
+        &self,
+        sender: &str,
+        gid: &str,
+        s: &InboundGroupSession,
+        env_id: &str,
+        plain: &InboxPlain,
+        index: u32,
+    ) -> Result<bool> {
         let mut c = self.conn();
         let tx = c.transaction()?;
+        let sid = s.session_id();
+        let seen: Option<String> = tx
+            .query_row("SELECT seen_idx FROM megolm_in WHERE sender=?1 AND session_id=?2", params![sender, sid], |r| r.get(0))
+            .optional()?;
+        let mut set = IndexSet::parse(seen.as_deref().unwrap_or(""));
+        if !set.insert(index) {
+            return Ok(false);
+        }
         Self::write_inbound(&tx, &self.cipher, sender, gid, s)?;
+        tx.execute("UPDATE megolm_in SET seen_idx=?3 WHERE sender=?1 AND session_id=?2", params![sender, sid, set.encode()])?;
         self.write_inbox_plain(&tx, env_id, plain)?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn has_inbound(&self, sender: &str, sid: &str) -> Result<bool> {
@@ -258,5 +273,59 @@ impl Store {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn pending_count(&self) -> Result<i64> {
         Ok(self.conn().query_row("SELECT COUNT(*) FROM megolm_pending", [], |r| r.get(0))?)
+    }
+}
+
+/// 一个 Megolm 入站会话里已处理过的消息序号（A8），存成升序、互不相接的闭区间，例如 `0-57,59,61-70`。
+/// 正常情况下（按序到达）只有一个区间。区间数超过上限时合并最小的两个（中间的空洞视为已处理）。
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct IndexSet(Vec<(u32, u32)>);
+
+impl IndexSet {
+    const MAX_RANGES: usize = 64;
+
+    pub fn parse(s: &str) -> Self {
+        let mut v: Vec<(u32, u32)> = s
+            .split(',')
+            .filter_map(|part| {
+                let (a, b) = part.split_once('-').unwrap_or((part, part));
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            })
+            .filter(|(a, b)| a <= b)
+            .collect();
+        v.sort_unstable();
+        IndexSet(v)
+    }
+
+    pub fn encode(&self) -> String {
+        let parts: Vec<String> = self.0.iter().map(|(a, b)| if a == b { a.to_string() } else { format!("{a}-{b}") }).collect();
+        parts.join(",")
+    }
+
+    pub fn contains(&self, i: u32) -> bool {
+        self.0.iter().any(|(a, b)| *a <= i && i <= *b)
+    }
+
+    /// 加入一个序号；已存在时返回 false。
+    pub fn insert(&mut self, i: u32) -> bool {
+        if self.contains(i) {
+            return false;
+        }
+        self.0.push((i, i));
+        self.0.sort_unstable();
+        // 合并相接的区间
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.0.len());
+        for (a, b) in self.0.drain(..) {
+            match merged.last_mut() {
+                Some(last) if last.1.saturating_add(1) >= a => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        while merged.len() > Self::MAX_RANGES {
+            let (_, b) = merged.remove(1);
+            merged[0].1 = b;
+        }
+        self.0 = merged;
+        true
     }
 }

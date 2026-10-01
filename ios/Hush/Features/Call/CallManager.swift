@@ -4,6 +4,19 @@ import AVFoundation
 import WebRTC
 import UIKit
 
+/// 因缺少权限而无法通话
+enum CallBlock: Equatable {
+    case microphone, camera
+
+    var endReason: String { self == .microphone ? "未获得麦克风权限" : "未获得摄像头权限" }
+    var title: String { self == .microphone ? "无法使用麦克风" : "无法使用摄像头" }
+    var message: String {
+        self == .microphone
+            ? "通话需要麦克风。请在系统「设置 › Hush」中允许使用麦克风后重试。"
+            : "视频通话需要摄像头。请在系统「设置 › Hush」中允许使用相机后重试。"
+    }
+}
+
 enum CallPhase: Equatable {
     case idle
     case outgoing      // 正在呼叫
@@ -19,8 +32,18 @@ final class CallManager {
     static let shared = CallManager()
 
     var phase: CallPhase = .idle {
-        didSet { applyDeviceState() }
+        didSet {
+            if !isLive { minimized = false; reconnecting = false }
+            applyDeviceState()
+            applyTone()
+        }
     }
+    /// 通话页最小化为悬浮条（可以回到聊天继续操作）
+    var minimized = false
+    /// 麦克风 / 摄像头权限被拒绝，通话已中止：通话页显示说明并引导去系统设置（A4）
+    var blocked: CallBlock?
+    /// 媒体连接中断（ICE disconnected / failed），正在尝试恢复（B7）
+    var reconnecting = false
     var peerId = ""
     var callId = ""
     var video = false
@@ -59,6 +82,17 @@ final class CallManager {
     @ObservationIgnored private var outgoingCandidates: [IceCandidate] = []
     @ObservationIgnored private var flushScheduled = false
     @ObservationIgnored private var timeoutWork: DispatchWorkItem?
+    /// 连接中断后的恢复期限；到期仍未恢复则结束通话
+    @ObservationIgnored private var reconnectWork: DispatchWorkItem?
+    /// 主叫正在做 ICE restart（已发出新的 offer，等待 answer）
+    @ObservationIgnored private var restarting = false
+    /// 去电的 offer 已发出（此后播放回铃音）
+    @ObservationIgnored private var offerSent = false
+    @ObservationIgnored private let tones = CallTones()
+    /// 超时时长（测试中缩短）
+    @ObservationIgnored var ringTimeout: TimeInterval = 30
+    @ObservationIgnored var connectTimeout: TimeInterval = 30
+    @ObservationIgnored var reconnectTimeout: TimeInterval = 20
     /// 每次新通话 / 结束通话都会递增；异步建立流程在每个 await 之后核对，过期即放弃
     @ObservationIgnored private(set) var currentAttempt = 0
     @ObservationIgnored private var setupTask: Task<Void, Never>?
@@ -74,7 +108,7 @@ final class CallManager {
         }
     }
 
-    var isPresented: Bool { phase != .idle }
+    var isPresented: Bool { phase != .idle || blocked != nil }
 
     /// 通话仍在进行（响铃、呼叫、连接、通话中）
     var isLive: Bool {
@@ -100,13 +134,15 @@ final class CallManager {
     func startCall(to userId: String, video: Bool) {
         guard !isLive else { core.toast = "当前正在通话中"; return }
         let attempt = beginAttempt()
+        blocked = nil
+        stopOtherAudio()
         peerId = userId
         callId = UUID().uuidString.lowercased()
         self.video = video
         isCaller = true
         resetMediaFlags()
         phase = .outgoing
-        armTimeout { [weak self] in
+        armTimeout(ringTimeout) { [weak self] in
             guard let self, self.phase == .outgoing else { return }
             self.send(.hangup)
             self.end("对方无应答")
@@ -114,8 +150,14 @@ final class CallManager {
         let cid = callId
         setupTask = Task { [weak self] in
             guard let self else { return }
-            await self.requestPermissions()
+            let block = await self.requestPermissions()
             guard self.isCurrent(attempt) else { return }
+            if let block {
+                // A4：没有权限就不呼叫（还没发出 offer，对方不会响铃）
+                self.end(block.endReason)
+                self.blocked = block
+                return
+            }
             do {
                 guard let pc = try await self.setupPeerConnection(attempt: attempt) else { return }
                 let offer = try await pc.offer(for: Self.constraints)
@@ -124,6 +166,9 @@ final class CallManager {
                 guard self.isCurrent(attempt) else { return }
                 try await self.core.sendCallSignal(to: userId, CallSignal(
                     callId: cid, action: .offer, video: video, sdp: offer.sdp, candidates: []))
+                guard self.isCurrent(attempt) else { return }
+                self.offerSent = true
+                self.applyTone()
             } catch {
                 guard self.isCurrent(attempt) else { return }
                 self.core.toast = "呼叫失败：\(describe(error))"
@@ -135,15 +180,23 @@ final class CallManager {
 
     func accept() {
         guard phase == .incoming, let sdp = remoteOfferSdp else { return }
-        timeoutWork?.cancel()
         phase = .connecting
+        NotificationService.shared.withdrawIncomingCall(callId: callId)
+        armConnectTimeout()
         let attempt = currentAttempt
         let (uid, cid, v) = (peerId, callId, video)
         setupTask?.cancel()
         setupTask = Task { [weak self] in
             guard let self else { return }
-            await self.requestPermissions()
+            let block = await self.requestPermissions()
             guard self.isCurrent(attempt) else { return }
+            if let block {
+                // A4：没有权限无法通话，告知对方并说明原因
+                self.send(.hangup)
+                self.end(block.endReason)
+                self.blocked = block
+                return
+            }
             do {
                 guard let pc = try await self.setupPeerConnection(attempt: attempt) else { return }
                 try await pc.setRemoteDescription(RTCSessionDescription(type: .offer, sdp: sdp))
@@ -187,6 +240,12 @@ final class CallManager {
         switch signal.action {
         case .offer:
             // 结束提示显示期间（.ended）视为空闲，可以接新来电
+            if signal.callId == callId, userId == peerId, !isCaller, phase == .active || phase == .connecting,
+               let sdp = signal.sdp, let pc, pc.remoteDescription != nil {
+                // B7：对方（主叫）做 ICE restart 发来的新 offer——在同一路通话上重新协商
+                renegotiate(pc, offer: sdp)
+                return
+            }
             if isLive || signal.callId == callId {
                 if signal.callId != callId {
                     let core = core
@@ -202,18 +261,31 @@ final class CallManager {
             isCaller = false
             remoteOfferSdp = signal.sdp
             resetMediaFlags()
+            blocked = nil
+            stopOtherAudio()
             phase = .incoming
-            NotificationService.shared.notifyIncomingCall(from: peerName, video: video)
-            armTimeout { [weak self] in
+            NotificationService.shared.notifyIncomingCall(callId: callId, from: peerName, video: video)
+            armTimeout(ringTimeout) { [weak self] in
                 guard let self, self.phase == .incoming else { return }
                 self.send(.hangup)
                 self.end("未接来电")
             }
         case .answer:
-            guard signal.callId == callId, userId == peerId, isCaller, phase == .outgoing,
-                  let sdp = signal.sdp, let pc else { return }
-            timeoutWork?.cancel()
+            guard signal.callId == callId, userId == peerId, isCaller, let sdp = signal.sdp, let pc else { return }
+            if restarting, phase == .active || phase == .connecting {
+                // B7：ICE restart 的应答
+                restarting = false
+                let attempt = currentAttempt
+                Task { [weak self] in
+                    try? await pc.setRemoteDescription(RTCSessionDescription(type: .answer, sdp: sdp))
+                    guard let self, self.isCurrent(attempt) else { return }
+                    self.flushRemoteCandidates()
+                }
+                return
+            }
+            guard phase == .outgoing else { return }
             phase = .connecting
+            armConnectTimeout()
             let attempt = currentAttempt
             Task { [weak self] in
                 do {
@@ -299,12 +371,86 @@ final class CallManager {
         connectedAt = nil
         pendingRemoteCandidates = []
         outgoingCandidates = []
+        minimized = false
+        reconnecting = false
+        restarting = false
+        offerSent = false
     }
 
-    private func requestPermissions() async {
-        _ = await AVCaptureDevice.requestAccess(for: .audio)
-        if video { _ = await AVCaptureDevice.requestAccess(for: .video) }
+    /// 权限检查（可在测试中替换）：返回 (麦克风, 摄像头) 是否已授权；未决定时会弹系统授权框
+    @ObservationIgnored var permissionRequest: (_ video: Bool) async -> (mic: Bool, camera: Bool) = { video in
+        let mic = await AVCaptureDevice.requestAccess(for: .audio)
+        let cam = video ? await AVCaptureDevice.requestAccess(for: .video) : true
+        return (mic, cam)
     }
+
+    /// A4：检查授权结果；被拒绝时返回原因，调用方中止通话
+    private func requestPermissions() async -> CallBlock? {
+        let r = await permissionRequest(video)
+        return Self.permissionBlock(mic: r.mic, camera: r.camera, video: video)
+    }
+
+    nonisolated static func permissionBlock(mic: Bool, camera: Bool, video: Bool) -> CallBlock? {
+        if !mic { return .microphone }
+        if video && !camera { return .camera }
+        return nil
+    }
+
+    /// 通话开始（呼出 / 来电）：停止正在播放的语音消息与进行中的录音（B7）
+    private func stopOtherAudio() {
+        VoicePlayer.shared.stop()
+        VoiceRecorder.cancelActive()
+    }
+
+    private func applyTone() {
+        tones.apply(CallTones.tone(phase: phase, isCaller: isCaller, offerSent: offerSent))
+    }
+
+    /// 被叫：主叫 ICE restart 后在同一路通话上重新协商
+    private func renegotiate(_ pc: RTCPeerConnection, offer sdp: String) {
+        let attempt = currentAttempt
+        let (uid, cid, v) = (peerId, callId, video)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await pc.setRemoteDescription(RTCSessionDescription(type: .offer, sdp: sdp))
+                guard self.isCurrent(attempt) else { return }
+                let answer = try await pc.answer(for: Self.constraints)
+                guard self.isCurrent(attempt) else { return }
+                try await pc.setLocalDescription(answer)
+                guard self.isCurrent(attempt) else { return }
+                try await self.core.sendCallSignal(to: uid, CallSignal(
+                    callId: cid, action: .answer, video: v, sdp: answer.sdp, candidates: []))
+            } catch {
+                // 重新协商失败不主动挂断：原连接可能自行恢复，否则由恢复期限结束通话
+            }
+        }
+    }
+
+    /// 主叫：连接中断后做一次 ICE restart（只由主叫发起，避免双方同时发 offer）
+    private func restartIce() {
+        guard isCaller, !restarting, isLive, let pc, pc.remoteDescription != nil else { return }
+        restarting = true
+        let attempt = currentAttempt
+        let (uid, cid, v) = (peerId, callId, video)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                pc.restartIce()
+                let offer = try await pc.offer(for: Self.restartConstraints)
+                guard self.isCurrent(attempt) else { return }
+                try await pc.setLocalDescription(offer)
+                guard self.isCurrent(attempt) else { return }
+                try await self.core.sendCallSignal(to: uid, CallSignal(
+                    callId: cid, action: .offer, video: v, sdp: offer.sdp, candidates: []))
+            } catch {
+                if self.isCurrent(attempt) { self.restarting = false }
+            }
+        }
+    }
+
+    private static let restartConstraints = RTCMediaConstraints(mandatoryConstraints: ["IceRestart": "true"],
+                                                               optionalConstraints: ["DtlsSrtpKeyAgreement": "true"])
 
     private func configureAudioSession() {
         let s = RTCAudioSession.sharedInstance()
@@ -402,12 +548,32 @@ final class CallManager {
     fileprivate func onIceState(_ s: RTCIceConnectionState) {
         switch s {
         case .connected, .completed:
+            reconnectWork?.cancel()
+            reconnectWork = nil
+            restarting = false
+            if reconnecting { reconnecting = false }
             if phase == .connecting || phase == .outgoing {
+                timeoutWork?.cancel()
                 phase = .active
                 if connectedAt == nil { connectedAt = Date() }
             }
-        case .failed:
-            if isLive { send(.hangup); end("网络连接失败") }
+        case .disconnected, .failed:
+            // B7：先提示并尝试恢复（主叫做 ICE restart），期限内恢复不了再结束
+            guard isLive, phase == .active || phase == .connecting else { return }
+            if Self.shouldShowReconnecting(phase: phase) && !reconnecting { reconnecting = true }
+            restartIce()
+            if reconnectWork == nil {
+                let w = DispatchWorkItem { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self, self.isLive, self.reconnectWork != nil else { return }
+                        self.reconnectWork = nil
+                        self.send(.hangup)
+                        self.end("网络连接失败")
+                    }
+                }
+                reconnectWork = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + reconnectTimeout, execute: w)
+            }
         default: break
         }
     }
@@ -430,16 +596,33 @@ final class CallManager {
         }
     }
 
-    private func armTimeout(_ run: @escaping () -> Void) {
+    /// 只有已经接通过的通话才提示「正在重连」；还在建立中的显示「正在连接…」
+    nonisolated static func shouldShowReconnecting(phase: CallPhase) -> Bool { phase == .active }
+
+    private func armTimeout(_ seconds: TimeInterval, _ run: @escaping () -> Void) {
         timeoutWork?.cancel()
         let w = DispatchWorkItem { MainActor.assumeIsolated { run() } }
         timeoutWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
+    }
+
+    /// B7：接听（或对方接听）后限时建立媒体连接，超时结束，不会一直停在「正在连接…」
+    private func armConnectTimeout() {
+        armTimeout(connectTimeout) { [weak self] in
+            guard let self, self.phase == .connecting else { return }
+            self.send(.hangup)
+            self.end("连接超时")
+        }
     }
 
     private func end(_ reason: String) {
         _ = beginAttempt()   // 让仍在 await 中的建立流程失效
         timeoutWork?.cancel()
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        restarting = false
+        offerSent = false
+        NotificationService.shared.withdrawIncomingCall(callId: callId)
         releaseMedia()
         remoteOfferSdp = nil
         interrupted = false
@@ -447,6 +630,8 @@ final class CallManager {
         s.lockForConfiguration()
         try? s.setActive(false)
         s.unlockForConfiguration()
+        // 通知其他 App（音乐等）可以恢复播放
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         phase = .ended(reason)
         let cid = callId
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in

@@ -46,6 +46,7 @@ struct ContactsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink(value: Route.addFriend) { Image(systemName: "person.crop.circle.badge.plus") }
+                    .accessibilityLabel("添加好友")
                     .accessibilityIdentifier("addFriendButton")
             }
         }
@@ -97,7 +98,7 @@ struct FriendRequestsView: View {
         HStack(spacing: 12) {
             AvatarView(seed: profile.id, name: profile.name, avatarId: profile.avatarId, size: 44)
             VStack(alignment: .leading, spacing: 2) {
-                Text(profile.name).font(.system(size: 16, weight: .medium))
+                Text(profile.name).font(Fonts.sized(16, weight: .medium))
                 if !r.message.isEmpty {
                     Text(r.message).font(Fonts.secondary).foregroundStyle(Theme.textSecondary).lineLimit(2)
                 }

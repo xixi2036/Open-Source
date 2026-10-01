@@ -14,7 +14,7 @@ pub(super) const DELETE_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// 撤回时间校验的时钟容差
 pub(super) const CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
 
-fn quote_text(body: &StoredBody) -> String {
+pub(super) fn quote_text(body: &StoredBody) -> String {
     let t = body.preview_text();
     if t.chars().count() > 200 {
         t.chars().take(200).collect()
@@ -103,12 +103,22 @@ impl Inner {
                 }
             }
             Err(_) => {
-                // 期间可能已收到回执，重新读取
-                if let Some(cur) = self.store.get_message(&row.id)? {
-                    row = cur;
+                // 只把仍在「发送中」的改为失败（A3：列级更新，基于库里最新的行）；期间已收到回执的保持回执状态
+                let failed = self.store.modify_message(&row.id, |r| {
+                    let sending = r.status == MessageStatus::Sending;
+                    if sending {
+                        r.status = MessageStatus::Failed;
+                    }
+                    sending
+                })?;
+                match failed {
+                    Some(cur) => row = cur,
+                    None => match self.store.get_message(&row.id)? {
+                        Some(cur) => row = cur,
+                        // 发送途中消息已被本地删除：不再为它发事件
+                        None => return res.map(|_| self.msg_item(&row)),
+                    },
                 }
-                row.status = MessageStatus::Failed;
-                self.store.update_message(&row)?;
             }
         }
         let item = self.msg_item(&row);
@@ -290,7 +300,8 @@ impl Inner {
     /// 删除会话（K1）：本地消息、附件缓存文件、草稿与会话行。群会话不退群，群里有新消息时会话重新出现。
     pub(crate) fn delete_conversation(&self, conv_id: &str) -> Result<()> {
         parse_conv(conv_id)?;
-        for m in self.store.messages(conv_id, None, u32::MAX)? {
+        // C5：只取有本地附件文件的消息（`has_files` 列），不再解密整个会话
+        for m in self.store.messages_with_files(conv_id)? {
             self.remove_local_files(&m);
         }
         self.store.delete_conversation(conv_id)?;
@@ -301,7 +312,7 @@ impl Inner {
 
     /// 重发失败的消息（文字 / 已上传的附件）。
     pub(crate) async fn resend(&self, message_id: &str) -> Result<MessageItem> {
-        let mut row = self.store.get_message(message_id)?.ok_or_else(|| HushError::not_found("消息"))?;
+        let row = self.store.get_message(message_id)?.ok_or_else(|| HushError::not_found("消息"))?;
         if !row.outgoing || row.status != MessageStatus::Failed {
             return Err(HushError::invalid("只能重发发送失败的消息"));
         }
@@ -312,8 +323,16 @@ impl Inner {
             }
             Err(e) => return Err(e),
         };
-        row.status = MessageStatus::Sending;
-        self.store.update_message(&row)?;
+        let row = self
+            .store
+            .modify_message(message_id, |r| {
+                let failed = r.outgoing && r.status == MessageStatus::Failed;
+                if failed {
+                    r.status = MessageStatus::Sending;
+                }
+                failed
+            })?
+            .ok_or_else(|| HushError::invalid("只能重发发送失败的消息"))?;
         self.emit(CoreEvent::MessageUpdated { conv_id: row.conv_id.clone(), message: self.msg_item(&row) });
         self.finish_send(row, content).await
     }
@@ -340,18 +359,28 @@ impl Inner {
         Ok(())
     }
 
-    pub(super) fn mark_deleted(&self, row: &mut MsgRow) -> Result<()> {
-        self.remove_local_files(row);
-        row.deleted = true;
-        row.msg = StoredMessage::plain(StoredBody::System { text: "此消息已撤回".into() }, None);
-        self.store.update_message(row)?;
-        self.emit(CoreEvent::MessageUpdated { conv_id: row.conv_id.clone(), message: self.msg_item(row) });
-        self.emit(CoreEvent::ConversationsChanged);
+    /// 把消息标为已撤回：正文换成占位、删除本地附件文件。已撤回或不存在时什么都不做。
+    pub(super) fn mark_deleted(&self, id: &str) -> Result<()> {
+        let mut before: Option<MsgRow> = None;
+        let after = self.store.modify_message(id, |r| {
+            if r.deleted {
+                return false;
+            }
+            before = Some(r.clone());
+            r.deleted = true;
+            r.msg = StoredMessage::plain(StoredBody::System { text: "此消息已撤回".into() }, None);
+            true
+        })?;
+        if let (Some(before), Some(after)) = (before, after) {
+            self.remove_local_files(&before);
+            self.emit(CoreEvent::MessageUpdated { conv_id: after.conv_id.clone(), message: self.msg_item(&after) });
+            self.emit(CoreEvent::ConversationsChanged);
+        }
         Ok(())
     }
 
     pub(crate) async fn delete_for_everyone(&self, message_id: &str) -> Result<()> {
-        let mut row = self.store.get_message(message_id)?.ok_or_else(|| HushError::not_found("消息"))?;
+        let row = self.store.get_message(message_id)?.ok_or_else(|| HushError::not_found("消息"))?;
         if !row.outgoing || row.deleted {
             return Err(HushError::invalid("只能撤回自己发送的消息"));
         }
@@ -360,7 +389,7 @@ impl Inner {
         }
         let c = Content::new(ContentBody::Delete { target_id: row.content_id().to_string() }, Self::group_of(&row.conv_id), 0);
         self.deliver(&row.conv_id, c, true).await?;
-        self.mark_deleted(&mut row)
+        self.mark_deleted(&row.id)
     }
 
     pub(crate) fn delete_local(&self, message_id: &str) -> Result<()> {
@@ -373,7 +402,7 @@ impl Inner {
     }
 
     pub(crate) fn clear_conversation(&self, conv_id: &str) -> Result<()> {
-        for m in self.store.messages(conv_id, None, u32::MAX)? {
+        for m in self.store.messages_with_files(conv_id)? {
             self.remove_local_files(&m);
         }
         for id in self.store.clear_conversation(conv_id)? {
@@ -383,32 +412,30 @@ impl Inner {
         Ok(())
     }
 
+    /// 会话已读（C4 / A3）：一条 UPDATE 把未读的收到消息标为已读（阅后即焚的开始计时），不逐条整行写回，
+    /// 所以不会覆盖并发到达的撤回。事件：只给开始计时的阅后即焚消息发 `MessageUpdated`（界面要显示倒计时），
+    /// 再发一个 `ConversationsChanged`；不再为每条消息各发一个事件。
     pub(crate) async fn mark_read(&self, conv_id: &str) -> Result<()> {
-        let now = now_ms();
-        let unread = self.store.unread_incoming(conv_id)?;
+        let rows = self.store.mark_conv_read(conv_id, now_ms())?;
         let mut by_sender: HashMap<String, Vec<String>> = HashMap::new();
-        for mut m in unread {
-            m.read = true;
-            m.status = MessageStatus::Read;
-            if m.expire_secs > 0 && m.expires_at.is_none() {
-                // 接收方已读开始计时
-                m.expires_at = Some(now + m.expire_secs as i64 * 1000);
-            }
-            self.store.update_message(&m)?;
-            let is_real = matches!(m.msg.body, StoredBody::Text { .. } | StoredBody::Attachments { .. }) && !m.sender_id.is_empty();
-            if is_real {
+        for m in &rows {
+            if m.msg.is_chat() && !m.sender_id.is_empty() {
                 by_sender.entry(m.sender_id.clone()).or_default().push(m.content_id().to_string());
             }
-            self.emit(CoreEvent::MessageUpdated { conv_id: conv_id.to_string(), message: self.msg_item(&m) });
+            if m.expire_secs > 0 {
+                self.emit(CoreEvent::MessageUpdated { conv_id: conv_id.to_string(), message: self.msg_item(m) });
+            }
         }
-        self.store.clear_unread(conv_id)?;
         self.emit(CoreEvent::ConversationsChanged);
         if self.settings().read_receipts && !by_sender.is_empty() {
             let group = Self::group_of(conv_id);
-            let items: Vec<(String, Content, bool)> = by_sender
-                .into_iter()
-                .map(|(uid, ids)| (uid, Content::new(ContentBody::Receipt { kind: ReceiptKind::Read, ids }, group.clone(), 0), false))
-                .collect();
+            let mut items: Vec<(String, Content, bool)> = Vec::new();
+            for (uid, ids) in by_sender {
+                for chunk in ids.chunks(500) {
+                    let rc = Content::new(ContentBody::Receipt { kind: ReceiptKind::Read, ids: chunk.to_vec() }, group.clone(), 0);
+                    items.push((uid.clone(), rc, false));
+                }
+            }
             for r in self.send_olm_batch(items).await? {
                 if let Err(e) = r {
                     tracing::warn!("已读回执发送失败: {e}");
@@ -432,8 +459,10 @@ impl Inner {
         self.ensure_conv(conv_id)?;
         let mut c = Content::new(ContentBody::Timer { expire_secs: secs }, Self::group_of(conv_id), secs);
         c.expire_set_at = c.ts;
-        let at = c.ts;
-        self.deliver(conv_id, c, true).await?;
+        let local_ts = c.ts;
+        let server_ts = self.deliver(conv_id, c, true).await?;
+        // A5：设置的变更时间记服务端时间（对方也用这条内容的信封时间），双方用同一个时钟仲裁「后写者胜」
+        let at = if server_ts > 0 { crate::store::clamp_ts(server_ts) } else { local_ts };
         self.set_timer(conv_id, secs, at)?;
         self.insert_system(conv_id, &format!("你将阅后即焚设置为：{}", describe_timer(secs)))?;
         Ok(())
@@ -537,11 +566,16 @@ mod tests {
         // 模拟已下载的附件缓存
         let cached = inner.attachment_path("m2", 0, "p.png");
         std::fs::write(&cached, b"plain").unwrap();
-        let mut row = inner.store.get_message("m2").unwrap().unwrap();
-        if let StoredBody::Attachments { items, .. } = &mut row.msg.body {
-            items[0].local_path = Some(cached.to_string_lossy().to_string());
-        }
-        inner.store.update_message(&row).unwrap();
+        let path = cached.to_string_lossy().to_string();
+        inner
+            .store
+            .modify_message("m2", |row| {
+                if let StoredBody::Attachments { items, .. } = &mut row.msg.body {
+                    items[0].local_path = Some(path.clone());
+                }
+                true
+            })
+            .unwrap();
         inner.set_draft(conv, Some("没发的话".into())).unwrap();
         let rx = events(&inner);
 
@@ -657,11 +691,16 @@ mod tests {
             .unwrap();
         let cached = inner.attachment_path("src", 0, "p.png");
         std::fs::write(&cached, b"plain").unwrap();
-        let mut row = inner.store.get_message("src").unwrap().unwrap();
-        if let StoredBody::Attachments { items, .. } = &mut row.msg.body {
-            items[0].local_path = Some(cached.to_string_lossy().to_string());
-        }
-        inner.store.update_message(&row).unwrap();
+        let path = cached.to_string_lossy().to_string();
+        inner
+            .store
+            .modify_message("src", |row| {
+                if let StoredBody::Attachments { items, .. } = &mut row.msg.body {
+                    items[0].local_path = Some(path.clone());
+                }
+                true
+            })
+            .unwrap();
 
         let out = inner.forward_message("src", vec!["u:carol".into(), "u:dave".into(), "u:carol".into()]).await.unwrap();
         assert_eq!(out.len(), 2, "目标去重");

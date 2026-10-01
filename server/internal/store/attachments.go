@@ -57,12 +57,40 @@ func (s *Store) DeleteStaleAttachments(ctx context.Context, ids []string, before
 	if len(ids) == 0 {
 		return out, nil
 	}
-	deleted, err := s.queryIDs(ctx, "DELETE FROM attachments WHERE id IN ("+placeholders(len(ids))+") AND "+staleCond+" RETURNING id",
-		append(toArgs(ids), before)...)
+	var deleted []string
+	err := s.withTx(ctx, func(tx dbtx) error {
+		var err error
+		deleted, err = queryIDs(ctx, tx, "DELETE FROM attachments WHERE id IN ("+placeholders(len(ids))+") AND "+staleCond+" RETURNING id",
+			append(toArgs(ids), before)...)
+		return err
+	})
 	for _, id := range deleted {
 		out[id] = true
 	}
 	return out, err
+}
+
+// OwnsAttachment 在事务内判断附件存在且是 uid 上传的。头像与朋友圈图片只能用自己上传的附件：
+// 否则任何人都能引用别人的附件 id，让它永久免于清理。
+func (t *Tx) OwnsAttachment(id, uid string) (bool, error) {
+	return exists(t.ctx, t.tx, "SELECT 1 FROM attachments WHERE id = ? AND uploader_id = ?", id, uid)
+}
+
+// ExistingAttachments 返回 ids 中有元数据的那些。
+func (s *Store) ExistingAttachments(ctx context.Context, ids []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(ids))
+	for len(ids) > 0 {
+		chunk := ids[:min(len(ids), 500)]
+		ids = ids[len(chunk):]
+		found, err := s.queryIDs(ctx, "SELECT id FROM attachments WHERE id IN ("+placeholders(len(chunk))+")", toArgs(chunk)...)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range found {
+			out[id] = true
+		}
+	}
+	return out, nil
 }
 
 // GetAttachment 查询附件元数据。

@@ -1,5 +1,6 @@
 package com.hush.app.ui.contacts
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.hush.app.util.net
 
 import androidx.compose.foundation.background
@@ -55,7 +56,7 @@ import uniffi.hushcore.Profile
 /** 添加好友：邮箱精确搜索 / 扫一扫 / 我的二维码。 */
 @Composable
 fun AddFriendScreen(onBack: () -> Unit, onProfile: (String) -> Unit, onScan: () -> Unit, onMyQr: () -> Unit) {
-    var email by remember { mutableStateOf("") }
+    var email by rememberSaveable { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<Profile?>(null) }
     var message by remember { mutableStateOf<String?>(null) }

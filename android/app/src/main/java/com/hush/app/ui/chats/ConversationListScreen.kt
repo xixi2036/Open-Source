@@ -1,5 +1,9 @@
 package com.hush.app.ui.chats
 
+import androidx.compose.material.icons.filled.NotificationsOff
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -86,6 +90,7 @@ fun ConversationListScreen(
             }
         }
         ConnectionBanner()
+        NotificationPermissionBanner()
         ConversationList(s, vm, onOpen, footer = {
             if (s.archivedCount > 0) {
                 Row(
@@ -111,19 +116,75 @@ fun ArchivedScreen(onBack: () -> Unit, onOpen: (String) -> Unit) {
     }
 }
 
+/**
+ * 连接状态提示条（会话列表与聊天页共用）：没有网络 / 连接中 / 未连接。已连接时不显示。
+ * 状态变化后稍等一下再显示，避免正常重连的一瞬间闪一下。
+ */
 @Composable
 fun ConnectionBanner() {
     val conn by HushCore.connection.collectAsState()
-    if (conn == ConnectionState.CONNECTED) return
+    val online by com.hush.app.core.NetworkMonitor.online.collectAsState()
+    val status = ConnectionStatus.of(online, conn == ConnectionState.CONNECTED, conn == ConnectionState.CONNECTING)
+    var shown by remember { mutableStateOf(ConnectionStatus.OK) }
+    LaunchedEffect(status) {
+        if (status != ConnectionStatus.OK && status != ConnectionStatus.OFFLINE) kotlinx.coroutines.delay(1200)
+        shown = status
+    }
+    val text = shown.text ?: return
+    val warn = shown != ConnectionStatus.CONNECTING
     Box(
-        Modifier.fillMaxWidth().background(if (conn == ConnectionState.CONNECTING) Hush.colors.accent.copy(alpha = 0.12f) else Hush.colors.danger.copy(alpha = 0.12f))
-            .padding(vertical = 4.dp),
+        Modifier.fillMaxWidth().background(if (warn) Hush.colors.danger.copy(alpha = 0.12f) else Hush.colors.accent.copy(alpha = 0.12f))
+            .padding(vertical = 4.dp).testTag("connection_banner"),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            if (conn == ConnectionState.CONNECTING) "连接中…" else "未连接",
-            style = HushType.secondary, color = if (conn == ConnectionState.CONNECTING) Hush.colors.accent else Hush.colors.danger,
-        )
+        Text(text, style = HushType.secondary, color = if (warn) Hush.colors.danger else Hush.colors.accent)
+    }
+}
+
+/** 连接状态文案（JVM 单测见 ConnectionStatusTest）。 */
+enum class ConnectionStatus(val text: String?) {
+    OK(null), OFFLINE("当前网络不可用"), CONNECTING("连接中…"), DISCONNECTED("未连接，正在重试…");
+
+    companion object {
+        fun of(online: Boolean, connected: Boolean, connecting: Boolean): ConnectionStatus = when {
+            !online -> OFFLINE
+            connected -> OK
+            connecting -> CONNECTING
+            else -> DISCONNECTED
+        }
+    }
+}
+
+/**
+ * B4：系统通知权限被拒 / 被关闭时的应用内引导（会话列表顶部）。
+ * 没有通知权限时后台的新消息与来电都不会有任何提示，必须让用户知道并能一键去开启。
+ */
+@Composable
+fun NotificationPermissionBanner() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var enabled by remember { mutableStateOf(com.hush.app.service.Notifier.notificationsEnabled(context)) }
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+        enabled = com.hush.app.service.Notifier.notificationsEnabled(context)
+        if (enabled) com.hush.app.service.Notifier.missedCallWithoutPermission.value = false
+    }
+    val missedCall by com.hush.app.service.Notifier.missedCallWithoutPermission.collectAsState()
+    var dismissed by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+    if (enabled || (dismissed && !missedCall)) return
+    Row(
+        Modifier.fillMaxWidth().background(Hush.colors.danger.copy(alpha = 0.10f))
+            .clickable { runCatching { context.startActivity(com.hush.app.service.Notifier.appNotificationSettings(context)) } }
+            .padding(start = 16.dp, top = 8.dp, bottom = 8.dp).testTag("notif_permission_banner"),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.NotificationsOff, null, tint = Hush.colors.danger, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(if (missedCall) "通知未开启，刚才有来电未能提醒" else "通知未开启", style = HushType.body, color = Hush.colors.textPrimary)
+            Text("应用在后台时收不到新消息和来电提醒，点按去开启", style = HushType.secondary, color = Hush.colors.textSecondary)
+        }
+        IconButton(onClick = { dismissed = true; com.hush.app.service.Notifier.missedCallWithoutPermission.value = false }) {
+            Icon(Icons.Filled.Close, "暂不开启", tint = Hush.colors.textSecondary)
+        }
     }
 }
 

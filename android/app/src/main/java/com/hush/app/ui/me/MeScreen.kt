@@ -1,5 +1,9 @@
 package com.hush.app.ui.me
 
+import androidx.fragment.app.FragmentActivity
+import com.hush.app.core.KeepAlive
+import androidx.compose.material.icons.filled.NotificationsOff
+import androidx.compose.material.icons.filled.BatteryChargingFull
 import android.os.Build
 import android.widget.Toast
 import androidx.biometric.BiometricManager
@@ -81,7 +85,13 @@ fun MeScreen(onEditProfile: () -> Unit, onMyQr: () -> Unit, onBlocked: () -> Uni
     LaunchedEffect(Unit) { settings = withContext(Dispatchers.IO) { runCatching { HushCore.client.settings() }.getOrNull() } }
     // Android 14+ 来电全屏提醒授权；从系统设置页返回时重新检查
     var fullScreenOk by remember { mutableStateOf(Notifier.canUseFullScreenIntent(context)) }
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { fullScreenOk = Notifier.canUseFullScreenIntent(context) }
+    var notifOk by remember { mutableStateOf(Notifier.notificationsEnabled(context)) }
+    var batteryOk by remember { mutableStateOf(KeepAlive.ignoringBatteryOptimizations(context)) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        fullScreenOk = Notifier.canUseFullScreenIntent(context)
+        notifOk = Notifier.notificationsEnabled(context)
+        batteryOk = KeepAlive.ignoringBatteryOptimizations(context)
+    }
     var disDialog by remember { mutableStateOf(false) }
     var logoutConfirm by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -122,22 +132,55 @@ fun MeScreen(onEditProfile: () -> Unit, onMyQr: () -> Unit, onBlocked: () -> Uni
             RowDivider(52)
             SettingsRow("默认阅后即焚", icon = Icons.Filled.Timer, value = TimeFormat.disappearing(settings?.defaultDisappearingSecs?.toInt() ?: 0), onClick = { disDialog = true })
             RowDivider(52)
-            SwitchRow("屏幕锁", screenLock, icon = Icons.Filled.Lock, subtitle = "打开应用时需验证生物识别或设备密码") { v ->
+            SwitchRow("屏幕锁", screenLock, icon = Icons.Filled.Lock, subtitle = "打开应用时需验证生物识别或设备密码；开启后最近任务中隐藏内容，通知不提供直接回复") { v ->
                 if (v) {
                     val can = BiometricManager.from(context).canAuthenticate(
                         BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL,
                     )
                     if (can == BiometricManager.BIOMETRIC_SUCCESS) HushCore.prefs.setScreenLock(true)
                     else Toast.makeText(context, "请先在系统设置中设置锁屏密码或生物识别", Toast.LENGTH_LONG).show()
-                } else HushCore.prefs.setScreenLock(false)
+                } else {
+                    // B12：关闭屏幕锁同样需要验证身份
+                    val activity = context as? FragmentActivity
+                    if (activity == null) HushCore.prefs.setScreenLock(false)
+                    else authenticate(
+                        activity, "关闭屏幕锁", "验证身份以关闭屏幕锁",
+                        onSuccess = { HushCore.prefs.setScreenLock(false) },
+                        onError = { Toast.makeText(context, "未通过验证，屏幕锁保持开启", Toast.LENGTH_SHORT).show() },
+                        // 设备已没有任何锁屏凭据：屏幕锁本来也无法使用，直接关闭
+                        onUnavailable = { action, reason ->
+                            if (action == LockPolicy.Action.DISABLE) HushCore.prefs.setScreenLock(false)
+                            else Toast.makeText(context, reason, Toast.LENGTH_SHORT).show()
+                        },
+                    )
+                }
             }
             RowDivider(52)
             SwitchRow("屏幕安全", screenSecure, icon = Icons.Filled.VisibilityOff, subtitle = "禁止截屏与录屏，最近任务中隐藏内容") { HushCore.prefs.setScreenSecurity(it) }
             RowDivider(52)
             SettingsRow("黑名单", icon = Icons.Filled.Block, onClick = onBlocked)
         }
-        SettingsGroup(title = "通知", footer = "为保护隐私，通知只显示“来自 xx 的新消息”，不显示消息内容。") {
+        SettingsGroup(title = "通知", footer = "为保护隐私，通知只显示会话名称与新消息数量，不显示消息内容。") {
             SwitchRow("消息通知", settings?.notifications == true, icon = Icons.Filled.Notifications) { v -> update { it.copy(notifications = v) } }
+            if (!notifOk) {
+                // B4：系统通知权限被拒 / 被关闭时，后台收不到任何消息与来电提醒
+                RowDivider(52)
+                SettingsRow(
+                    "系统通知权限", icon = Icons.Filled.NotificationsOff, value = "未开启",
+                    subtitle = "未开启时，应用在后台收不到新消息和来电提醒",
+                    onClick = { runCatching { context.startActivity(Notifier.appNotificationSettings(context)) } },
+                    modifier = Modifier.testTag("me_notif_permission"),
+                )
+            }
+            RowDivider(52)
+            // B3：电池优化白名单。未豁免时系统在息屏一段时间后会限制后台网络，长连接可能中断
+            SettingsRow(
+                "后台保持连接", icon = Icons.Filled.BatteryChargingFull, value = if (batteryOk) "已允许" else "受限",
+                subtitle = if (batteryOk) "已允许后台运行，息屏后仍可及时收到消息与来电" else "系统电池优化可能在息屏后中断连接，点按允许后台运行",
+                showChevron = !batteryOk,
+                onClick = { if (!batteryOk) KeepAlive.openBatteryOptimization(context) },
+                modifier = Modifier.testTag("me_battery"),
+            )
             if (!fullScreenOk) {
                 RowDivider(52)
                 SettingsRow(

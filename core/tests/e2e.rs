@@ -831,6 +831,11 @@ async fn flow_expired(url: &str) {
     eventually("LoggedOut(session_expired)", || expired(&kim).then_some(())).await;
     assert!(matches!(kim.c.start(), Err(HushError::NotLoggedIn)));
     eprintln!("✓ REST 401 → session_expired");
+    // 审查 B1：401 只清 token，加密状态留到重新登录；同一数据目录重新登录后照常可用
+    let acc = kim.c.verify_code(url.into(), "kim@hush.test".into(), CODE.into()).await.expect("401 之后重新登录");
+    assert_eq!(acc.user_id, kim.uid);
+    kim.c.get_user(kim.uid.clone()).await.expect("重新登录后接口可用");
+    eprintln!("✓ 401 之后重新登录");
 
     // WS 握手 401
     let lee = quick_login(url, "Lee").await;
@@ -1015,6 +1020,79 @@ async fn flow_v3(url: &str) {
     let msgs = ann.c.messages(gc.clone(), None, 50).unwrap();
     assert_eq!(msgs.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![nm.id], "只有新消息");
     eprintln!("✓ K1 删除会话");
+
+    audit_fixes(url, &ann, &cat).await;
+}
+
+struct LogCollector(Arc<Mutex<Vec<(LogLevel, String, String)>>>);
+
+impl LogListener for LogCollector {
+    fn on_log(&self, level: LogLevel, module: String, message: String) {
+        self.0.lock().unwrap().push((level, module, message));
+    }
+}
+
+/// 2026-09-30 审查修复在真实服务端上的回归：回执攒批后送达 / 已读状态照常到达；未读数随删除回落；
+/// 异步搜索；公网明文地址被拒；日志出口能收到日志且不含 token 与消息明文。
+async fn audit_fixes(url: &str, ann: &TC, cat: &TC) {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    set_log_listener(Arc::new(LogCollector(logs.clone())));
+    let ac = ann.c.direct_conversation_id(cat.uid.clone());
+    let ca = cat.c.direct_conversation_id(ann.uid.clone());
+    ann.c.mark_read(ac.clone()).await.unwrap();
+
+    // C3：连发 6 条，Ann 的送达回执攒成一批发出，Cat 这边每条都变为 delivered；Ann 已读后变为 read
+    let mut sent = Vec::new();
+    for i in 0..6 {
+        sent.push(cat.c.send_text(ca.clone(), format!("审查回归-机密内容-{i}"), None).await.unwrap().id);
+    }
+    eventually("Ann 收到 6 条", || (ann.c.conversation(ac.clone()).unwrap().unwrap().unread_count == 6).then_some(())).await;
+    let status = |id: &str| cat.msgs(&ca).into_iter().find(|m| m.id == id).unwrap().status;
+    eventually("6 条都送达", || sent.iter().all(|id| status(id) == MessageStatus::Delivered).then_some(())).await;
+
+    // A10：删掉一条未读，未读数回落
+    ann.c.delete_local(sent[0].clone()).unwrap();
+    assert_eq!(ann.c.conversation(ac.clone()).unwrap().unwrap().unread_count, 5);
+    // C4：mark_read 之后未读清零，对方看到已读
+    ann.events.lock().unwrap().clear();
+    ann.c.mark_read(ac.clone()).await.unwrap();
+    assert_eq!(ann.c.conversation(ac.clone()).unwrap().unwrap().unread_count, 0);
+    eventually("其余 5 条已读", || sent[1..].iter().all(|id| status(id) == MessageStatus::Read).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let updates = ann.events.lock().unwrap().iter().filter(|e| matches!(e, CoreEvent::MessageUpdated { .. })).count();
+    assert_eq!(updates, 0, "mark_read 不再为每条消息各发一个 MessageUpdated");
+
+    // C2：异步搜索与同步版本结果一致
+    let sync_hits: Vec<String> = ann.c.search_messages("审查回归".into()).unwrap().into_iter().map(|m| m.id).collect();
+    let async_hits: Vec<String> = ann.c.search_messages_async("审查回归".into()).await.unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(sync_hits.len(), 5);
+    assert_eq!(sync_hits, async_hits);
+
+    // B1：公网明文地址在发请求之前就被拒绝；本机地址（本测试的服务端）一直可用；调试开关可放开
+    let dir = tempfile::tempdir().unwrap();
+    let c = HushClient::new(dir.path().to_string_lossy().to_string(), db_key("Zed"), "android".into(), "zed".into()).unwrap();
+    let e = c.request_code("http://hush.example.com".into(), "zed@hush.test".into()).await.unwrap_err();
+    assert!(matches!(e, HushError::InvalidInput { .. }), "{e:?}");
+    c.request_code(url.into(), "zed@hush.test".into()).await.expect("本机 http 地址照常可用");
+    c.set_allow_insecure_http(true);
+
+    // 日志出口：制造一条日志（不存在的用户 → 同步失败之类不一定有，这里用一次必然失败的重发）
+    let _ = ann.c.sync_now().await;
+    // 必然产生一条告警：离线的数据目录里重发一条发不出去的消息
+    let _ = c.send_text("u:nobody".into(), "机密内容-发不出去".into(), None).await;
+    let _ = c.start();
+    let token = ann.c.debug_token().unwrap();
+    let all = eventually("日志出口收到日志", || {
+        let v = logs.lock().unwrap().clone();
+        (!v.is_empty()).then_some(v)
+    })
+    .await;
+    for (_, module, msg) in &all {
+        assert!(module.starts_with("hushcore"), "只转发核心自己的日志: {module}");
+        assert!(!msg.contains(&token), "日志里不能有 token");
+        assert!(!msg.contains("机密内容"), "日志里不能有消息明文: {msg}");
+    }
+    eprintln!("✓ 审查修复回归（回执攒批、未读数、异步搜索、https 约束、日志出口 {} 条）", all.len());
 }
 
 async fn eventually_async_envs(t: &TC) -> Vec<hushcore::api::Envelope> {

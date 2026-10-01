@@ -4,7 +4,7 @@ Hush（密语）客户端核心库（Rust）。网络、端到端加密、本地
 
 - 加密：[vodozemac](https://github.com/matrix-org/vodozemac) 0.11 的 Olm（1:1）和 Megolm（群），SessionConfig 用 v2；附件与本地字段加密用 RustCrypto `aes-gcm`；安全码用 `sha2`。本库没有自己实现任何密码学原语，也没有参考 Signal 源码。
 - 网络：`reqwest` + `tokio-tungstenite`。TLS 用 rustls，crypto provider 选 ring，根证书用 webpki-roots。不依赖 openssl / native-tls。
-- 存储：`rusqlite`（bundled SQLite，WAL 模式），按 `PRAGMA user_version` 迁移（当前 v4）。消息正文、附件密钥、草稿、登录 token、收件箱中已解密的明文用库密钥做 AES-256-GCM 字段级加密。vodozemac pickle 用库密钥加密后存储。收到的信封先落收件箱再解密，棘轮状态与明文同一事务保存，进程被杀不丢消息。
+- 存储：`rusqlite`（bundled SQLite，WAL 模式），按 `PRAGMA user_version` 迁移（当前 v5），`secure_delete=ON`。消息正文、附件密钥、草稿、登录 token、收件箱中已解密的明文用库密钥做 AES-256-GCM 字段级加密。vodozemac pickle 用库密钥加密后存储。收到的信封先落收件箱再解密，棘轮状态与明文同一事务保存，进程被杀不丢消息。
 - 附件：分块 AES-256-GCM（格式 v2：64 KiB 明文块，nonce = 8 字节随机前缀 ‖ 4 字节块序号，最后一块在 AAD 中标记 final），文件→文件流式加解密、流式上传下载，内存占用与附件大小无关；旧格式 v1（整文件 GCM）仍可解密。格式细节见 CORE_NOTES 第 1 节。
 - 异步：库内有一个全局 tokio 多线程运行时。所有 `async` 导出函数都 spawn 到这个运行时上执行，调用方只等待结果。在 Kotlin 里是 `suspend fun`，在 Swift 里是 `async throws`。
 
@@ -34,13 +34,13 @@ uniffi-bindgen.rs   绑定生成器入口
 
 | 分类 | 方法 |
 |---|---|
-| 构造 | `new(data_dir, db_key[32], platform, device_name)`（库密钥与已有库不符时返回 `KeyMismatch`）、`set_listener(EventListener)` |
+| 构造 | `new(data_dir, db_key[32], platform, device_name)`（库密钥与已有库不符时返回 `KeyMismatch`）、`set_listener(EventListener)`、`set_allow_insecure_http(bool)`（调试：允许公网明文 http）、顶层函数 `set_log_listener(LogListener)`（日志出口） |
 | 账号 | `request_code(server_url, email)`、`verify_code(server_url, email, code) -> MyAccount`、`is_logged_in()`、`my_account()`、`logout()` |
 | 连接 | `start()`（WS 循环 + OTK 补充 + 阅后即焚定时器；WS 任务已退出时会重新拉起）、`stop()`、`connection_state()`、`sync_now()`（HTTP 拉取一次） |
 | 资料 | `update_profile(name?, about?, avatar_path?)`、`get_user`、`search_user_by_email`、`cached_profile`、`fetch_avatar(avatar_id) -> 本地路径` |
 | 好友 | `send_friend_request`、`list_friend_requests`、`accept_friend_request`、`reject_friend_request`、`refresh_friends`、`friends`、`remove_friend`、`block`、`unblock`、`blocked`、`my_qr_payload` |
 | 会话 | `conversations(archived)`、`conversation(id)`、`direct_conversation_id(user_id)`、`set_pinned` / `set_muted` / `set_archived`、`clear_conversation`、`delete_conversation`（v3）、`set_draft(conv_id, text?)`（v3） |
-| 消息 | `messages(conv_id, before_ts?, limit)`（翻页游标为 `MessageItem.sort_ts`）、`search_messages`、`send_text(conv_id, text, quote_id?)`、`send_text_with_mentions(conv_id, text, quote_id?, mentions)`（v3）、`forward_message(message_id, conv_ids) -> [MessageItem]`（v3）、`send_attachment(conv_id, file_path, mime, kind, caption?, meta)`、`resend`、`download_attachment(message_id, index) -> 本地路径`、`react`、`delete_for_everyone`、`delete_local`、`mark_read`、`set_typing`、`set_disappearing` |
+| 消息 | `messages(conv_id, before_ts?, limit)`（翻页游标为 `MessageItem.sort_ts`）、`search_messages` / `search_messages_async`（最多 200 条）、`send_text(conv_id, text, quote_id?)`、`send_text_with_mentions(conv_id, text, quote_id?, mentions)`（v3）、`forward_message(message_id, conv_ids) -> [MessageItem]`（v3）、`send_attachment(conv_id, file_path, mime, kind, caption?, meta)`、`resend`、`download_attachment(message_id, index) -> 本地路径`、`react`、`delete_for_everyone`、`delete_local`、`mark_read`、`set_typing`、`set_disappearing` |
 | 群 | `create_group`、`refresh_groups`、`groups`、`group_info`、`update_group`、`add_members`、`remove_member`、`leave_group`、`set_admin` |
 | 安全码 | `safety_number(user_id) -> SafetyNumber`、`set_verified`、`verify_safety_qr(user_id, payload) -> bool` |
 | 朋友圈 | `moments_feed(before?)`、`user_moments(uid, before?)`、`moment(id)`（不可见时 `NotFound`）、`post_moment(text, image_paths, visibility)`、`delete_moment`、`like_moment(id, like)`、`comment_moment(id, text, reply_to?)`、`delete_comment`、`moment_notifications`、`fetch_media(attachment_id) -> 本地路径` |
@@ -49,11 +49,15 @@ uniffi-bindgen.rs   绑定生成器入口
 
 会话 id：单聊为 `u:<user_id>`，群聊为 `g:<group_id>`。
 
-事件：平台层实现 `EventListener.on_event(CoreEvent)`，核心在后台线程回调。事件类型有 `ConnectionChanged`、`ConversationsChanged`、`MessageAdded`、`MessageUpdated`、`MessageRemoved`、`Typing`、`FriendRequestReceived`、`FriendsChanged`、`GroupsChanged`、`CallSignalReceived`、`MomentNotification`、`KeyChanged`、`LoggedOut`。回调**按发出顺序**在核心专门的事件线程 `hushcore-events` 上执行（不在任何内部锁内），平台层需要自己切换到 UI 线程。回调里抛出的异常会被核心兜住并记日志，不会终止连接或后台任务。`on_event` 仍应尽快返回：它阻塞期间后续事件会排队等待。
+事件：平台层实现 `EventListener.on_event(CoreEvent)`，核心在后台线程回调。事件类型有 `ConnectionChanged`、`ConversationsChanged`、`MessageAdded`、`MessageUpdated`、`MessageRemoved`、`Typing`、`FriendRequestReceived`、`FriendsChanged`、`GroupsChanged`、`CallSignalReceived`、`MomentNotification`、`KeyChanged`、`LoggedOut`。回调**按发出顺序**（三种「请刷新」事件除外，它们会去抖合并，见下）在核心专门的事件线程 `hushcore-events` 上执行（不在任何内部锁内），平台层需要自己切换到 UI 线程。回调里抛出的异常会被核心兜住并记日志，不会终止连接或后台任务。`on_event` 仍应尽快返回：它阻塞期间后续事件会排队等待。
 
 - `MessageAdded.backlog`：为 true 时是积压 / 补拉到的消息，平台不应弹实时横幅。
 - `MessageAdded.mentions_me`（v3）：收到的消息提及了我；会话免打扰时平台也应通知。
 - `LoggedOut.reason`：`logged_in_elsewhere`（4001，在别处登录）、`session_expired`（任何接口或 WS 握手 401，登录已过期）、或服务端 `logged_out` 帧带的原因。
+- **服务器地址**：公网地址必须是 https；本机与内网地址（`127.0.0.1`、`10.0.2.2`、`192.168.x.x`、`.local` 等）可以用 http。没写协议时内网补 http、公网补 https。
+- `ConversationsChanged` / `FriendsChanged` / `GroupsChanged` 会去抖合并；待投递事件过多时丢弃积压的消息事件并补一个 `ConversationsChanged`，收到它应重新读取。
+- **日志**：`set_log_listener` 之后核心的日志（级别、模块、文本；不含消息明文、密钥、token）在 `hushcore-log` 线程回调。
+- 2026-09-30 审查修复（新增导出、行为变化、性能数字）见 CORE_NOTES 第 13 节。
 - 接口 v2 的全部变化见 CORE_NOTES 第 11 节，v3（删除会话、转发、草稿、@提及、统一排序）见第 12 节。
 
 ### 典型用法（Kotlin）

@@ -1,0 +1,15 @@
+// 签名配置（不要在这里写入真实的团队 ID）。
+//
+// 开发团队 ID 有三种传入方式，任选其一：
+//   1. 在本目录新建 Local.xcconfig（已被 .gitignore 忽略），写一行：
+//        HUSH_DEVELOPMENT_TEAM = ABCDE12345
+//   2. 构建时用环境变量：
+//        HUSH_DEVELOPMENT_TEAM=ABCDE12345 xcodebuild -scheme Hush -configuration Release archive
+//   3. 构建时用命令行参数：
+//        xcodebuild ... DEVELOPMENT_TEAM=ABCDE12345
+//
+// 都不提供时 DEVELOPMENT_TEAM 为空：模拟器构建不受影响，真机 / 归档会提示需要选择团队。
+#include? "Local.xcconfig"
+
+DEVELOPMENT_TEAM = $(HUSH_DEVELOPMENT_TEAM)
+CODE_SIGN_STYLE = Automatic

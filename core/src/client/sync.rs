@@ -26,6 +26,8 @@ const REPLACED_RETRY_MS: u64 = 3_000;
 /// 处理失败（网络类）的信封/事件：首次延迟这么久后经 HTTP 重新拉取，之后逐次翻倍，最长 60 秒
 const REDELIVERY_BASE_MS: u64 = 2_000;
 const REDELIVERY_MAX_MS: u64 = 60_000;
+/// 已读到、等待处理的 WS 帧队列长度（B6）
+const FRAME_QUEUE: usize = 64;
 /// HTTP 拉取每页条数
 const POLL_LIMIT: usize = 100;
 /// 去重记录保留时长
@@ -72,17 +74,38 @@ enum FrameAction {
 
 /// 解析一个信封。格式错误时返回 `Err(Some(id))`：无法处理但能取到 id，应直接 ack（避免每次重连都重投）；
 /// 取不到 id 时返回 `Err(None)`，只能忽略。
-fn parse_envelope(raw: &Value) -> std::result::Result<Envelope, Option<String>> {
-    serde_json::from_value(raw.clone()).map_err(|e| match raw.get("id").and_then(|i| i.as_str()) {
+///
+/// A2：`from`（以及群消息的 `group_id`）必须是服务端生成的那种 UUID；为空或别的形状说明服务端有缺陷或恶意，
+/// 直接确认丢弃——旧版本会为 `from:""` 建出会话 `u:`，之后会话列表恒报错。
+/// A6：`server_ts` 钳到「当前时间 + 1 天」以内，负数视为未知。
+pub(super) fn parse_envelope(raw: &Value) -> std::result::Result<Envelope, Option<String>> {
+    let id = raw.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
+    let reject = |why: String| match &id {
         Some(id) => {
-            tracing::warn!("信封 {id} 格式错误，已确认丢弃: {e}");
-            Some(id.to_string())
+            tracing::warn!("信封 {id} 格式错误，已确认丢弃: {why}");
+            Some(id.clone())
         }
         None => {
-            tracing::warn!("信封格式错误且缺少 id，忽略: {e}");
+            tracing::warn!("信封格式错误且缺少 id，忽略: {why}");
             None
         }
-    })
+    };
+    let mut env: Envelope = serde_json::from_value(raw.clone()).map_err(|e| reject(e.to_string()))?;
+    if !is_uuid(&env.from) {
+        return Err(reject("from 不是合法的用户 id".into()));
+    }
+    match (env.kind.as_str(), env.group_id.as_deref()) {
+        ("megolm", Some(g)) if is_uuid(g) => {}
+        ("megolm", _) => return Err(reject("群消息的 group_id 不是合法的群 id".into())),
+        _ => {}
+    }
+    env.server_ts = crate::store::clamp_ts(env.server_ts);
+    Ok(env)
+}
+
+/// 服务端的用户 id / 群 id 都是规范的 36 字符 UUID。
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36 && uuid::Uuid::parse_str(s).is_ok()
 }
 
 fn jitter(ms: u64) -> u64 {
@@ -196,6 +219,11 @@ impl Inner {
                 break;
             }
             let Ok(auth) = self.auth() else { break };
+            // B1：公网明文地址不建连接（token 会在握手里裸奔）
+            if let Err(e) = crate::api::ensure_secure(&auth.server_url, self.allow_insecure_http()) {
+                tracing::warn!("不连接服务器: {e}");
+                break;
+            }
             self.set_connection_state(ConnectionState::Connecting);
             let max_frame = self.ws_frame_limit();
             match ws::connect_with_limit(&auth.server_url, &auth.token, max_frame).await {
@@ -277,47 +305,92 @@ impl Inner {
     }
 
     /// 单次连接的收发循环。
+    ///
+    /// B6：帧的**处理**与连接的**读写**解耦。收到的文本帧放进一个有界队列，由同一任务里并发轮询的处理器按顺序处理
+    /// （解密、落库、可能有 HTTP 请求），处理结果（ack 等）再交回这里发出。于是处理一帧很慢时：
+    /// - 心跳照常发送、服务端的帧照常读取，不会因为「一直没读」被空闲判断误判为超时（有帧在处理时也不做空闲判断）；
+    /// - `reconnect` 通知不会丢：等待者在连接建立时就登记好（`enable`），不依赖通知到来那一刻循环正好在等它。
+    ///
+    /// 处理器与读写在同一个任务里，`stop()` 中止任务时一并取消（与之前一样，由收件箱保证不丢消息）。
     async fn run_connection(self: &Arc<Self>, stream: ws::WsStream, stop: &mut watch::Receiver<bool>) -> ConnEnd {
         let (mut sink, mut source) = stream.split();
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
         let mut last_rx = tokio::time::Instant::now();
-        // 连接建立后、收到 queue_empty 之前推送的都是积压（C-F）
-        let mut backlog = true;
-        loop {
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<String>(FRAME_QUEUE);
+        let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<FrameAction>();
+        let me = self.clone();
+        let processor = async move {
+            // 连接建立后、收到 queue_empty 之前推送的都是积压（C-F）
+            let mut backlog = true;
+            while let Some(text) = frame_rx.recv().await {
+                let action = me.handle_frame(&text, backlog).await;
+                if matches!(action, FrameAction::QueueEmpty) {
+                    backlog = false;
+                }
+                if action_tx.send(action).is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::pin!(processor);
+        let mut processor_done = false;
+        let reconnect = self.reconnect.notified();
+        tokio::pin!(reconnect);
+        reconnect.as_mut().enable();
+        // 已入队、尚未处理完的帧数
+        let mut in_flight = 0usize;
+        let end = loop {
             tokio::select! {
                 _ = stop.changed() => {
                     let _ = sink.send(Message::Close(None)).await;
                     return ConnEnd::Stopped;
                 }
-                _ = self.reconnect.notified() => {
+                _ = &mut reconnect => {
                     tracing::info!("主动重连以重新接收未确认的数据");
                     let _ = sink.send(Message::Close(None)).await;
-                    return ConnEnd::Dropped;
+                    break ConnEnd::Dropped;
+                }
+                // 处理器只有在帧队列关闭后才会结束，正常不会走到这里
+                _ = &mut processor, if !processor_done => {
+                    processor_done = true;
+                    break ConnEnd::Dropped;
+                }
+                Some(action) = action_rx.recv() => {
+                    in_flight = in_flight.saturating_sub(1);
+                    // 处理耗时不算空闲
+                    last_rx = tokio::time::Instant::now();
+                    match action {
+                        FrameAction::Ack(ids) if !ids.is_empty() => {
+                            let frame = json!({"t": "ack", "ids": ids}).to_string();
+                            if sink.send(Message::Text(frame.into())).await.is_err() {
+                                break ConnEnd::Dropped;
+                            }
+                        }
+                        FrameAction::LoggedOut(r) => return ConnEnd::LoggedOut(r),
+                        _ => {}
+                    }
                 }
                 _ = ping.tick() => {
-                    if last_rx.elapsed() > IDLE_TIMEOUT {
+                    if in_flight == 0 && last_rx.elapsed() > IDLE_TIMEOUT {
                         tracing::warn!("WebSocket 空闲超时，重连");
-                        return ConnEnd::Dropped;
+                        break ConnEnd::Dropped;
                     }
                     if sink.send(Message::Text(r#"{"t":"ping"}"#.into())).await.is_err() {
-                        return ConnEnd::Dropped;
+                        break ConnEnd::Dropped;
                     }
                 }
-                msg = source.next() => {
+                // 队列有空位才读下一帧：处理不过来时靠 TCP 反压，而不是无限缓存
+                (permit, msg) = async { (frame_tx.reserve().await, source.next().await) } => {
                     last_rx = tokio::time::Instant::now();
                     match msg {
                         Some(Ok(Message::Text(t))) => {
-                            match self.handle_frame(t.as_str(), backlog).await {
-                                FrameAction::QueueEmpty => backlog = false,
-                                FrameAction::Ack(ids) if !ids.is_empty() => {
-                                    let frame = json!({"t": "ack", "ids": ids}).to_string();
-                                    if sink.send(Message::Text(frame.into())).await.is_err() {
-                                        return ConnEnd::Dropped;
-                                    }
+                            match permit {
+                                Ok(p) => {
+                                    p.send(t.as_str().to_string());
+                                    in_flight += 1;
                                 }
-                                FrameAction::LoggedOut(r) => return ConnEnd::LoggedOut(r),
-                                _ => {}
+                                Err(_) => break ConnEnd::Dropped,
                             }
                         }
                         Some(Ok(Message::Ping(p))) => {
@@ -328,26 +401,36 @@ impl Inner {
                                 match u16::from(f.code) {
                                     // 4001：在别处登录 / token 作废；4000：同一账号建立了新连接（被挤下线）
                                     4001 => return ConnEnd::LoggedOut("logged_in_elsewhere".into()),
-                                    4000 => return ConnEnd::Replaced,
+                                    4000 => break ConnEnd::Replaced,
                                     _ => {}
                                 }
                             }
-                            return ConnEnd::Dropped;
+                            break ConnEnd::Dropped;
                         }
                         Some(Ok(_)) => {}
                         Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(e))) => {
                             tracing::warn!("服务端帧超过读取上限（{e}），改用 HTTP 拉取");
-                            return ConnEnd::Oversized;
+                            break ConnEnd::Oversized;
                         }
                         Some(Err(e)) => {
                             tracing::warn!("WebSocket 读取错误: {e}");
-                            return ConnEnd::Dropped;
+                            break ConnEnd::Dropped;
                         }
-                        None => return ConnEnd::Dropped,
+                        None => break ConnEnd::Dropped,
                     }
                 }
             }
+        };
+        // 连接已断：已经读到的帧照常处理完（ack 发不出去了，服务端重发时按去重记录直接确认），
+        // 而不是在处理到一半时取消；期间仍响应停止信号
+        drop(frame_tx);
+        if !processor_done {
+            tokio::select! {
+                _ = &mut processor => {}
+                _ = stop.changed() => return ConnEnd::Stopped,
+            }
         }
+        end
     }
 
     async fn handle_frame(self: &Arc<Self>, text: &str, backlog: bool) -> FrameAction {
@@ -555,6 +638,7 @@ impl Inner {
             }
             "friend_accepted" => {
                 let uid = str_field("user_id");
+                self.forget_claim_refusal(Some(&uid));
                 self.store.add_friend(&uid)?;
                 if self.store.get_profile(&uid)?.is_none() {
                     let _ = self.get_user(&uid).await;
@@ -834,8 +918,23 @@ mod tests {
     fn malformed_envelopes() {
         assert_eq!(parse_envelope(&serde_json::json!({"id": "x1", "kind": 5})).unwrap_err(), Some("x1".into()));
         assert_eq!(parse_envelope(&serde_json::json!({"kind": "olm"})).unwrap_err(), None);
-        let ok = serde_json::json!({"id": "e", "kind": "olm", "from": "u", "type": 1, "body": "AA=="});
+        let uid = "6f1b3a52-8a39-4b55-a3f4-0d6a1f5f0c11";
+        let ok = serde_json::json!({"id": "e", "kind": "olm", "from": uid, "type": 1, "body": "AA=="});
         assert_eq!(parse_envelope(&ok).unwrap().id, "e");
+        // A2：from / group_id 必须是服务端生成的 UUID
+        for from in ["", "u", "../x", "6f1b3a52-8a39-4b55-a3f4-0d6a1f5f0c1"] {
+            let bad = serde_json::json!({"id": "e2", "kind": "olm", "from": from, "type": 1, "body": "AA=="});
+            assert_eq!(parse_envelope(&bad).unwrap_err(), Some("e2".into()), "from={from:?}");
+        }
+        let grp = |gid: serde_json::Value| serde_json::json!({"id": "e3", "kind": "megolm", "from": uid, "group_id": gid, "session_id": "s", "body": "AA=="});
+        assert!(parse_envelope(&grp(serde_json::json!(uid))).is_ok());
+        assert_eq!(parse_envelope(&grp(serde_json::json!(""))).unwrap_err(), Some("e3".into()));
+        assert_eq!(parse_envelope(&grp(serde_json::Value::Null)).unwrap_err(), Some("e3".into()));
+        // A6：server_ts 钳到当前时间附近
+        let far = serde_json::json!({"id": "e4", "kind": "olm", "from": uid, "type": 1, "body": "AA==", "server_ts": i64::MAX});
+        assert!(parse_envelope(&far).unwrap().server_ts <= crate::util::now_ms() + crate::store::MAX_FUTURE_MS);
+        let neg = serde_json::json!({"id": "e5", "kind": "olm", "from": uid, "type": 1, "body": "AA==", "server_ts": -5});
+        assert_eq!(parse_envelope(&neg).unwrap().server_ts, 0);
     }
 
     /// 上传媒体：数据直接交给请求，成功后缓存到 media/<id>，不留临时文件。
@@ -981,5 +1080,74 @@ mod tests {
             };
             assert_eq!(got, backlog);
         }
+    }
+
+    /// B6：处理一帧很慢（这里是需要两次慢 HTTP 请求的事件）期间到达的「要求重连」通知不能丢；
+    /// 连接的读写不被帧处理挡住。旧实现在读循环里内联处理帧，通知到来时循环没有在等它，`notify_waiters` 直接丢失。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_request_not_lost_while_processing_slow_frame() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let closed = Arc::new(AtomicBool::new(false));
+        let frame_sent = Arc::new(AtomicBool::new(false));
+        let (c2, f2) = (closed.clone(), frame_sent.clone());
+        let server = tokio::spawn(async move {
+            let mut first_ws = true;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let (closed, frame_sent) = (c2.clone(), f2.clone());
+                let mut head = [0u8; 10];
+                let n = sock.peek(&mut head).await.unwrap_or(0);
+                if head[..n].starts_with(b"GET /v1/ws") {
+                    let first = std::mem::replace(&mut first_ws, false);
+                    tokio::spawn(async move {
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else { return };
+                        if !first {
+                            // 重连后的连接：保持打开即可
+                            while ws.next().await.is_some() {}
+                            return;
+                        }
+                        let ev = r#"{"t":"event","d":{"id":"ev1","type":"friend_accepted","user_id":"bob"}}"#;
+                        ws.send(Message::Text(ev.into())).await.unwrap();
+                        frame_sent.store(true, Ordering::SeqCst);
+                        while let Some(m) = ws.next().await {
+                            if matches!(m, Ok(Message::Close(_)) | Err(_)) {
+                                break;
+                            }
+                        }
+                        closed.store(true, Ordering::SeqCst);
+                    });
+                } else {
+                    // HTTP：每个请求拖 2 秒再回 404（处理 friend_accepted 要连发两个）
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let _ = sock.read(&mut buf).await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let body = r#"{"error":"not_found","message":"slow"}"#;
+                        let resp = format!("HTTP/1.1 404 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        let (inner, _dir) = test_inner_at(&url);
+        inner.start().unwrap();
+        let wait = |flag: Arc<AtomicBool>, ms: u64| async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+            while !flag.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            flag.load(Ordering::SeqCst)
+        };
+        assert!(wait(frame_sent.clone(), 5_000).await, "应建立连接并收到事件帧");
+        // 此时核心正卡在处理这一帧（慢 HTTP）。要求重连：
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        inner.reconnect.notify_waiters();
+        assert!(wait(closed.clone(), 1_200).await, "帧处理期间到达的重连请求应立即关闭连接，不能丢");
+        inner.stop();
+        server.abort();
     }
 }

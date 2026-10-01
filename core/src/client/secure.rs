@@ -17,6 +17,10 @@ use crate::util::{b64d, b64e, now_ms};
 
 const MEGOLM_MAX_MESSAGES: u32 = 100;
 const MEGOLM_MAX_AGE_MS: i64 = 7 * 24 * 3600 * 1000;
+/// 群成员 claim 被拒（403 / 404）后这么久之内不再为他 claim（A11）
+const CLAIM_NEGATIVE_TTL_MS: i64 = 5 * 60 * 1000;
+/// 解密成功但本版本解析不了的可见消息的占位文本（A1）
+pub(crate) const UNSUPPORTED_TEXT: &str = "[不支持的消息，请升级]";
 
 /// 出站 Megolm 会话是否需要轮换：已发满 100 条、超过 7 天，或者**已分发名单里有人不在当前成员表中**。
 /// 最后一条保证即使「删除出站会话」与并发发送交错、旧会话被写回，下一次发送也一定会轮换，
@@ -47,6 +51,8 @@ pub enum EnvelopeOutcome {
     Decrypted(Box<Incoming>),
     /// 无法解密（已记录占位消息）
     Undecryptable,
+    /// 解密成功但本版本解析不了（已记录「不支持的消息」，或是不可见的控制内容、直接忽略）
+    Unsupported,
     /// 群消息缺密钥，已挂起
     Pending,
     /// 丢弃（拉黑等）
@@ -65,22 +71,71 @@ impl Inner {
 
     /// 为其中还没有 Olm 会话的对端并发预先 claim（在 crypto_lock 之外），结果交给随后持锁的 `olm_encrypt_locked`。
     /// 期间若对端的会话已由别的任务建立，预取的 OTK 会被浪费一个，对端下次补充即可。
-    pub(crate) async fn prefetch_claims<'a>(&self, uids: impl IntoIterator<Item = &'a str>) -> Claims {
+    ///
+    /// `negative_cache`（A11，群 room_key 分发用）：某成员的 claim 最近被服务端拒绝（403 / 404：已不是好友或共同群成员、
+    /// 没有可用预密钥）时，几分钟内直接沿用那次的错误，不再请求——否则每条群消息都会为他多 claim 两次，
+    /// 很快撞上服务端每分钟 10 次的限速。单聊发送不走负缓存（用户主动发消息时总是真的试一次）。
+    pub(crate) async fn prefetch_claims<'a>(&self, uids: impl IntoIterator<Item = &'a str>, negative_cache: bool) -> Claims {
         use futures_util::StreamExt;
         let mut todo: Vec<String> = Vec::new();
+        let mut out = Claims::new();
         for u in uids {
-            if !todo.iter().any(|t| t == u) && !self.store.has_olm_session(u).unwrap_or(true) {
-                todo.push(u.to_string());
+            if todo.iter().any(|t| t == u) || out.contains_key(u) || self.store.has_olm_session(u).unwrap_or(true) {
+                continue;
+            }
+            match negative_cache.then(|| self.claim_recently_refused(u)).flatten() {
+                Some(e) => {
+                    out.insert(u.to_string(), Err(e));
+                }
+                None => todo.push(u.to_string()),
             }
         }
-        futures_util::stream::iter(todo)
+        let fetched: Vec<(String, Result<ClaimResp>)> = futures_util::stream::iter(todo)
             .map(|u| async move {
                 let r = self.claim_key(&u).await;
                 (u, r)
             })
             .buffer_unordered(8)
             .collect()
-            .await
+            .await;
+        let mut neg = self.claim_refused.lock().unwrap_or_else(|e| e.into_inner());
+        for (u, r) in fetched {
+            match &r {
+                Ok(_) => {
+                    neg.remove(&u);
+                }
+                Err(e) if e.is_server_code("forbidden") || e.is_server_code("not_found") => {
+                    neg.insert(u.clone(), (now_ms(), e.clone()));
+                }
+                Err(_) => {}
+            }
+            out.insert(u, r);
+        }
+        out
+    }
+
+    /// 该用户的 claim 最近被服务端拒绝过（负缓存未过期）时返回那次的错误。
+    fn claim_recently_refused(&self, uid: &str) -> Option<HushError> {
+        let mut neg = self.claim_refused.lock().unwrap_or_else(|e| e.into_inner());
+        match neg.get(uid) {
+            Some((at, e)) if now_ms() - *at < CLAIM_NEGATIVE_TTL_MS => Some(e.clone()),
+            Some(_) => {
+                neg.remove(uid);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// 对端换了密钥 / 成为好友 / 重新登录：之前被拒的 claim 现在可能成功，清掉负缓存。
+    pub(crate) fn forget_claim_refusal(&self, uid: Option<&str>) {
+        let mut neg = self.claim_refused.lock().unwrap_or_else(|e| e.into_inner());
+        match uid {
+            Some(u) => {
+                neg.remove(u);
+            }
+            None => neg.clear(),
+        }
     }
 
     /// 用 claim 结果建立出站会话，并按需记录 / 更新对端身份（调用方持有 crypto_lock）。
@@ -132,7 +187,7 @@ impl Inner {
     /// 批量经 Olm 发送内容。返回与输入一一对应的结果（Ok(server_ts) 或错误）。
     pub(crate) async fn send_olm_batch(&self, items: Vec<(String, Content, bool)>) -> Result<Vec<Result<i64>>> {
         let api = self.api()?;
-        let mut claims = self.prefetch_claims(items.iter().map(|i| i.0.as_str())).await;
+        let mut claims = self.prefetch_claims(items.iter().map(|i| i.0.as_str()), false).await;
         let mut results: Vec<Result<i64>> = Vec::with_capacity(items.len());
         let mut wire = Vec::new();
         let mut index = Vec::new();
@@ -191,7 +246,7 @@ impl Inner {
             Some(g) => {
                 let shared = self.store.get_outbound(gid)?.map(|o| o.shared_with).unwrap_or_default();
                 let cands: Vec<String> = g.member_ids().into_iter().filter(|u| *u != me && !shared.contains(u)).collect();
-                self.prefetch_claims(cands.iter().map(|s| s.as_str())).await
+                self.prefetch_claims(cands.iter().map(|s| s.as_str()), true).await
             }
             None => Claims::new(),
         };
@@ -232,7 +287,7 @@ impl Inner {
         if !failed.is_empty() {
             tracing::info!("群 {gid} 的 room_key 对 {} 人发送失败，重试一次", failed.len());
             let retry = std::mem::take(&mut failed);
-            let mut claims = self.prefetch_claims(retry.iter().map(|s| s.as_str())).await;
+            let mut claims = self.prefetch_claims(retry.iter().map(|s| s.as_str()), true).await;
             let (retry_msgs, mut still) = {
                 let _g = self.crypto_lock.lock().await;
                 self.encrypt_room_keys_locked(gid, &session_id, &room_key, retry, &mut claims).await?
@@ -347,9 +402,10 @@ impl Inner {
 
     /// 明文 → `Incoming`。经 Megolm 收到的要求 `Content.group_id` 与信封一致。
     fn incoming_from_plain(self: &Arc<Self>, env: &Envelope, plain: &[u8], olm_session_id: Option<String>, backlog: bool) -> Result<EnvelopeOutcome> {
-        let content = match Content::from_bytes(plain) {
+        let content = match serde_json::from_slice::<Content>(plain) {
             Ok(c) => c,
-            Err(e) => return self.undecryptable(env, &format!("明文格式错误: {e}"), backlog),
+            // A1②：解密成功、只是本版本解析不了（对方版本更新）——不是解密失败，会话是好的，不发 session_reset
+            Err(e) => return self.unsupported(env, plain, &e, backlog),
         };
         let via_group = if env.kind == "megolm" {
             let gid = env.group_id.clone().unwrap_or_default();
@@ -448,6 +504,39 @@ impl Inner {
         }
     }
 
+    /// 解密成功但内容解析失败（A1②）。可见消息（文字 / 附件，或根本看不出类型）存成一条「不支持的消息」提示；
+    /// 已知的不可见控制内容（回执、输入状态、通话信令等）结构对不上时直接忽略，不打扰用户。
+    /// 不发 session_reset、不计入「无法解密」。日志只记错误类别：serde 的错误文本可能带出明文片段。
+    fn unsupported(self: &Arc<Self>, env: &Envelope, plain: &[u8], err: &serde_json::Error, backlog: bool) -> Result<EnvelopeOutcome> {
+        let loose: Option<serde_json::Value> = serde_json::from_slice(plain).ok();
+        let body_type = loose.as_ref().and_then(|v| v.get("body")).and_then(|b| b.get("type")).and_then(|t| t.as_str());
+        tracing::warn!(
+            "来自 {} 的内容本版本无法解析（类型 {}，{:?} 第 {} 列），按不支持的内容处理",
+            env.from,
+            body_type.unwrap_or("未知"),
+            err.classify(),
+            err.column()
+        );
+        if !matches!(body_type, None | Some("text") | Some("attachment")) {
+            return Ok(EnvelopeOutcome::Unsupported);
+        }
+        // 沿用内容自带的 id（同一内容经不同信封重发时不重复）；取不到或不合法就用信封 id
+        let id = loose
+            .as_ref()
+            .and_then(|v| v.get("id"))
+            .and_then(|i| i.as_str())
+            .filter(|i| crate::store::valid_content_id(i))
+            .unwrap_or(&env.id)
+            .to_string();
+        let conv = match (&env.kind[..], &env.group_id) {
+            ("megolm", Some(g)) => group_conv(g),
+            _ => direct_conv(&env.from),
+        };
+        let body = crate::store::StoredBody::System { text: UNSUPPORTED_TEXT.into() };
+        self.store_incoming_notice(&conv, &id, env, body, backlog)?;
+        Ok(EnvelopeOutcome::Unsupported)
+    }
+
     pub(crate) fn undecryptable(self: &Arc<Self>, env: &Envelope, why: &str, backlog: bool) -> Result<EnvelopeOutcome> {
         tracing::warn!("来自 {} 的消息无法解密: {why}", env.from);
         Self::stat_inc(&self.stats.undecryptable);
@@ -455,7 +544,7 @@ impl Inner {
             ("megolm", Some(g)) => group_conv(g),
             _ => direct_conv(&env.from),
         };
-        self.store_incoming_placeholder(&conv, env, backlog)?;
+        self.store_incoming_notice(&conv, &env.id, env, crate::store::StoredBody::Undecryptable, backlog)?;
         if env.kind == "olm" {
             self.maybe_send_session_reset(&env.from);
         }
@@ -482,15 +571,37 @@ impl Inner {
             if !me.same_session(generation) {
                 return;
             }
-            {
-                let _g = me.crypto_lock.lock().await;
-                let _ = me.store.delete_olm_sessions(&uid);
-            }
-            let c = Content::new(ContentBody::SessionReset {}, None, 0);
-            if let Err(e) = me.send_olm(&uid, c, false).await {
+            if let Err(e) = me.send_session_reset(&uid).await {
                 tracing::warn!("发送 session_reset 失败: {e}");
             }
         });
+    }
+
+    /// 发送 session_reset（A1①）。**不删除**与该用户已有的会话：一条坏信封（垃圾数据、重复投递的旧消息）
+    /// 不能让对方此前用旧会话发出、还在途中的消息全部解不开。做法是 claim 新密钥、新建一个出站会话并把它设为首选
+    /// （`last_used` 最大），reset 本身经这个新会话以 PreKey 消息送达；对方收到后同样把它作为首选。
+    /// 旧会话留着继续解密在途消息，之后按每个对端最多 5 个会话的上限自然淘汰。
+    async fn send_session_reset(&self, uid: &str) -> Result<()> {
+        let api = self.api()?;
+        let claim = self.claim_key(uid).await?;
+        let c = Content::new(ContentBody::SessionReset {}, None, 0);
+        let (t, body) = {
+            let _g = self.crypto_lock.lock().await;
+            let acc = self.store.load_account()?.ok_or(HushError::NotLoggedIn)?;
+            let newest = self.store.load_olm_sessions(uid)?.iter().map(|s| s.last_used).max().unwrap_or(0);
+            let mut entry = self.create_outbound_session(&acc, uid, claim)?;
+            let (t, bytes) = olm::encrypt(&mut entry.session, &c.to_bytes())?;
+            entry.last_used = now_ms().max(newest + 1);
+            self.store.save_olm_session(uid, &entry)?;
+            Self::stat_inc(&self.stats.olm_prekey_tx);
+            (t, b64e(bytes))
+        };
+        let wire = json!([{"to": uid, "type": t, "body": body, "client_id": c.id, "urgent": false}]);
+        let resp: OlmSendResp = api.post("/v1/messages", &json!({ "messages": wire })).await?;
+        match resp.results.first().and_then(|r| r.error_code()) {
+            Some(code) => Err(HushError::Server { code, message: format!("发送给 {uid} 失败") }),
+            None => Ok(()),
+        }
     }
 
     async fn decrypt_megolm(self: &Arc<Self>, env: &Envelope, backlog: bool) -> Result<EnvelopeOutcome> {
@@ -510,9 +621,14 @@ impl Inner {
                     } else {
                         let bytes = b64d(&env.body)?;
                         match megolm::decrypt_detailed(&mut s, &bytes) {
-                            Ok(p) => {
+                            Ok((p, index)) => {
                                 let saved = InboxPlain { plaintext: b64e(&p), olm_session_id: None };
-                                self.store.save_inbound_decrypt(&env.from, &gid, &s, &env.id, &saved)?;
+                                // A8：这个序号的消息已经处理过——同一密文被重放（去重记录 30 天后过期，
+                                // 已焚毁 / 已删除的消息不能因此重新出现）。正常的重投在解密之前就被信封级去重拦下了
+                                if !self.store.save_inbound_decrypt(&env.from, &gid, &s, &env.id, &saved, index)? {
+                                    tracing::warn!("丢弃 {} 重放的群消息（会话 {sid} 序号 {index} 已处理过）", env.from);
+                                    return Ok(EnvelopeOutcome::Dropped);
+                                }
                                 Some(Ok(p))
                             }
                             // 消息早于本地密钥的起点：挂起，等待更早位置导出的 room_key
@@ -605,13 +721,12 @@ impl Inner {
             .collect())
     }
 
-    /// session_reset：保留承载该消息的会话，丢弃其余会话。
+    /// 收到 session_reset（A1①）：承载它的会话是对方刚建立的新会话，解密时已成为最近使用的会话，
+    /// 之后发给对方的内容都用它加密。**不再丢弃其余会话**：对方在发出 reset 之前用旧会话发的消息可能还在途中，
+    /// 删了就全部解不开；旧会话按每个对端最多 5 个的上限自然淘汰。
     pub(crate) async fn on_session_reset(&self, from: &str, keep: Option<&str>) -> Result<()> {
-        let _g = self.crypto_lock.lock().await;
-        match keep {
-            Some(sid) => self.store.delete_olm_sessions_except(from, sid),
-            None => self.store.delete_olm_sessions(from),
-        }
+        tracing::info!("{from} 请求重建会话，之后使用会话 {}", keep.unwrap_or("（未知）"));
+        Ok(())
     }
 }
 

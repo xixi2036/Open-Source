@@ -4,6 +4,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{AttachmentKind, CallAction, IceCandidate, Mention};
 
+/// 宽松解析会随版本扩展的枚举（A1③）：认识的值照常解析，不认识的（未来版本新增）返回 None，
+/// 由各字段决定怎么兜底，而不是让整条内容解析失败。
+fn de_lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
+}
+
+/// 未知的附件类型（例如未来的 `sticker`）按普通文件处理：能显示、能下载。
+/// `AttachmentKind` 是导出给两端的枚举，不在上面加变体（两端的 `when` / `switch` 是穷尽的）。
+fn de_attachment_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<AttachmentKind, D::Error> {
+    Ok(de_lenient(d)?.unwrap_or(AttachmentKind::File))
+}
+
+/// 未知的通话信令动作解析为 None，接收方忽略该信令（`CallAction` 同样是导出枚举，不加变体）。
+fn de_call_action<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<CallAction>, D::Error> {
+    de_lenient(d)
+}
+
 pub const CONTENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +106,7 @@ pub struct WireAttachment {
     pub mime: String,
     #[serde(default)]
     pub file_name: String,
+    #[serde(deserialize_with = "de_attachment_kind")]
     pub kind: AttachmentKind,
     #[serde(default)]
     pub width: u32,
@@ -107,6 +130,9 @@ fn format_v1() -> u32 {
 pub enum ReceiptKind {
     Delivered,
     Read,
+    /// 未来版本新增的回执类型：忽略。
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +140,9 @@ pub enum ReceiptKind {
 pub enum TypingAction {
     Started,
     Stopped,
+    /// 未来版本新增的输入状态：忽略。
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,7 +185,9 @@ pub enum ContentBody {
     },
     Call {
         call_id: String,
-        action: CallAction,
+        /// 本版本不认识的动作为 None（见 `de_call_action`）
+        #[serde(deserialize_with = "de_call_action")]
+        action: Option<CallAction>,
         #[serde(default)]
         video: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +226,7 @@ impl Content {
         serde_json::to_vec(self).expect("Content 序列化不会失败")
     }
 
+    #[cfg(test)]
     pub fn from_bytes(b: &[u8]) -> crate::error::Result<Self> {
         Ok(serde_json::from_slice(b)?)
     }
@@ -255,7 +287,7 @@ mod tests {
             ContentBody::Timer { expire_secs: 30 },
             ContentBody::Call {
                 call_id: "c".into(),
-                action: CallAction::Offer,
+                action: Some(CallAction::Offer),
                 video: true,
                 sdp: Some("v=0".into()),
                 candidates: Some(vec![IceCandidate { sdp: "cand".into(), sdp_mid: Some("0".into()), sdp_mline_index: Some(0) }]),
@@ -340,6 +372,23 @@ mod tests {
             vec![m("b", 2, 3), m("", 2, 3), m("c", 2, 0), m("d", 6, 3), m("e", 1, 2), m("f", 0, 1), m("g", 7, 1), m("b", 2, 3), m("h", u32::MAX, 2)],
         );
         assert_eq!(got, vec![m("b", 2, 3), m("g", 7, 1)]);
+    }
+
+    /// A1③：会随版本扩展的枚举遇到未知值时兜底，整条内容照常解析。
+    #[test]
+    fn unknown_enum_values_tolerated() {
+        let parse = |body: serde_json::Value| serde_json::from_value::<Content>(json!({"v":1,"id":"m","ts":1,"body":body})).unwrap().body;
+        match parse(json!({"type":"attachment","attachments":[{"id":"a","key":"k","digest":"d","size":3,"kind":"sticker"}]})) {
+            ContentBody::Attachment { attachments, .. } => assert_eq!(attachments[0].kind, AttachmentKind::File),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parse(json!({"type":"receipt","kind":"played","ids":["x"]})), ContentBody::Receipt { kind: ReceiptKind::Unknown, ids: vec!["x".into()] });
+        assert_eq!(parse(json!({"type":"typing","action":"recording"})), ContentBody::Typing { action: TypingAction::Unknown });
+        assert!(matches!(parse(json!({"type":"call","call_id":"c","action":"hold"})), ContentBody::Call { action: None, .. }));
+        assert!(matches!(parse(json!({"type":"call","call_id":"c","action":"offer"})), ContentBody::Call { action: Some(CallAction::Offer), .. }));
+        // 已知值的线上格式不变
+        let c = Content::new(ContentBody::Call { call_id: "c".into(), action: Some(CallAction::Hangup), video: false, sdp: None, candidates: None }, None, 0);
+        assert_eq!(serde_json::to_value(&c).unwrap()["body"], json!({"type":"call","call_id":"c","action":"hangup","video":false}));
     }
 
     #[test]

@@ -27,6 +27,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.focusable
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
@@ -64,6 +71,31 @@ object LockPolicy {
     }
 }
 
+/**
+ * 弹出系统身份验证（生物识别或设备凭据）。返回 false 表示当前无法验证（[onUnavailable] 已带上原因）。
+ * 上锁页解锁、以及在设置里关闭屏幕锁（B12：关闭也必须验证，否则拿到已解锁手机的人可以直接关掉它）共用。
+ */
+fun authenticate(
+    activity: FragmentActivity,
+    title: String,
+    subtitle: String,
+    onSuccess: () -> Unit,
+    onError: (String) -> Unit,
+    onUnavailable: (LockPolicy.Action, String) -> Unit,
+) {
+    val auth = BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL
+    val status = BiometricManager.from(activity).canAuthenticate(auth)
+    when (val action = LockPolicy.decide(status)) {
+        LockPolicy.Action.PROMPT -> Unit
+        else -> { onUnavailable(action, LockPolicy.reason(status)); return }
+    }
+    val bp = BiometricPrompt(activity, ContextCompat.getMainExecutor(activity), object : BiometricPrompt.AuthenticationCallback() {
+        override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) { onSuccess() }
+        override fun onAuthenticationError(code: Int, msg: CharSequence) { onError(msg.toString()) }
+    })
+    bp.authenticate(BiometricPrompt.PromptInfo.Builder().setTitle(title).setSubtitle(subtitle).setAllowedAuthenticators(auth).build())
+}
+
 /** 屏幕锁：BiometricPrompt（允许设备凭据）。作为覆盖层盖在主导航之上，拦截触摸与返回键。 */
 @Composable
 fun LockScreen() {
@@ -71,32 +103,32 @@ fun LockScreen() {
     var error by remember { mutableStateOf<String?>(null) }
     fun prompt() {
         val activity = context as? FragmentActivity ?: return
-        val auth = BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL
-        val status = BiometricManager.from(context).canAuthenticate(auth)
-        when (LockPolicy.decide(status)) {
-            LockPolicy.Action.PROMPT -> Unit
-            LockPolicy.Action.DISABLE -> {
-                HushCore.prefs.setScreenLock(false); AppLock.unlock()
-                Toast.makeText(context, "设备未设置锁屏密码或生物识别，屏幕锁已关闭", Toast.LENGTH_LONG).show()
-                return
-            }
-            LockPolicy.Action.RETRY -> { error = "${LockPolicy.reason(status)}，请稍后点“解锁”重试"; return }
-        }
-        val bp = BiometricPrompt(activity, ContextCompat.getMainExecutor(context), object : BiometricPrompt.AuthenticationCallback() {
-            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) { AppLock.unlock() }
-            override fun onAuthenticationError(code: Int, msg: CharSequence) { error = msg.toString() }
-        })
-        bp.authenticate(
-            BiometricPrompt.PromptInfo.Builder().setTitle("解锁 Hush").setSubtitle("验证身份以继续").setAllowedAuthenticators(auth).build(),
+        authenticate(
+            activity, "解锁 Hush", "验证身份以继续",
+            onSuccess = { AppLock.unlock() },
+            onError = { error = it },
+            onUnavailable = { action, reason ->
+                if (action == LockPolicy.Action.DISABLE) {
+                    HushCore.prefs.setScreenLock(false); AppLock.unlock()
+                    Toast.makeText(context, "设备未设置锁屏密码或生物识别，屏幕锁已关闭", Toast.LENGTH_LONG).show()
+                } else error = "$reason，请稍后点“解锁”重试"
+            },
         )
     }
     LaunchedEffect(Unit) { prompt() }
+    // A1：锁屏页自己持有焦点，键盘/硬件按键输入不会落到下层的输入框
+    val holder = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { holder.requestFocus() } }
     // 锁定期间返回键不得操作下层导航：直接把应用退到后台
     BackHandler { (context as? Activity)?.moveTaskToBack(true) }
     Column(
         Modifier.fillMaxSize().background(Hush.colors.background)
             // 拦截触摸，不让事件落到下层的主导航
             .pointerInput(Unit) { detectTapGestures { } }
+            .focusRequester(holder).focusable()
+            // 吞掉全部按键（硬件键盘、adb input），返回键由上面的 BackHandler 处理
+            .onPreviewKeyEvent { it.key != Key.Back }
+            .testTag("lock_screen")
             .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {

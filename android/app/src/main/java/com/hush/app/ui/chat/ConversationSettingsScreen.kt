@@ -1,5 +1,6 @@
 package com.hush.app.ui.chat
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -95,8 +96,8 @@ fun ConversationSettingsScreen(
     LaunchedEffect(finished) { if (finished != null) onLeft() }
     com.hush.app.util.ToastCollector(vm.toast)
 
-    var disappearingDialog by remember { mutableStateOf(false) }
-    var confirm by remember { mutableStateOf<String?>(null) }
+    var disappearingDialog by rememberSaveable { mutableStateOf(false) }
+    var confirm by rememberSaveable { mutableStateOf<String?>(null) }
 
     Column(Modifier.fillMaxSize().background(Hush.colors.background)) {
         HushTopBar(if (vm.groupId != null) "群聊信息" else "聊天信息", onBack = onBack)
@@ -184,10 +185,13 @@ fun CircleAction(icon: ImageVector, label: String, onClick: () -> Unit) {
 @Composable
 private fun GroupHeader(s: ConvSettingsState, vm: ConversationSettingsViewModel, onAddMembers: (String) -> Unit, onProfile: (String) -> Unit) {
     val g = s.group
-    var edit by remember { mutableStateOf<String?>(null) }
-    var memberMenu by remember { mutableStateOf<GroupMember?>(null) }
-    var removeMode by remember { mutableStateOf(false) }
-    var confirmRemove by remember { mutableStateOf<GroupMember?>(null) }
+    var edit by rememberSaveable { mutableStateOf<String?>(null) }
+    // A4：只保存成员 id（可跨重建恢复），成员对象每次从最新的群信息里取
+    var memberMenuId by rememberSaveable { mutableStateOf<String?>(null) }
+    var removeMode by rememberSaveable { mutableStateOf(false) }
+    var confirmRemoveId by rememberSaveable { mutableStateOf<String?>(null) }
+    val memberMenu = memberMenuId?.let { id -> g?.members?.firstOrNull { it.userId == id } }
+    val confirmRemove = confirmRemoveId?.let { id -> g?.members?.firstOrNull { it.userId == id } }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(vm::setGroupAvatar) }
     Column(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Avatar(
@@ -213,7 +217,7 @@ private fun GroupHeader(s: ConvSettingsState, vm: ConversationSettingsViewModel,
                 val removable = removeMode && s.isAdmin && m.userId != HushCore.myId && m.role != GroupRole.OWNER
                 MemberCell(m, removable, onClick = {
                     // 移除模式下只有带减号的成员可点，且需二次确认；群主与自己不可移除
-                    if (removeMode) { if (removable) confirmRemove = m } else memberMenu = m
+                    if (removeMode) { if (removable) confirmRemoveId = m.userId } else memberMenuId = m.userId
                 })
             }
             // 服务端只允许群主/管理员添加成员（普通成员调用返回 403），普通成员不显示“添加”
@@ -226,32 +230,32 @@ private fun GroupHeader(s: ConvSettingsState, vm: ConversationSettingsViewModel,
     memberMenu?.let { m ->
         val isMe = m.userId == HushCore.myId
         AlertDialog(
-            onDismissRequest = { memberMenu = null },
+            onDismissRequest = { memberMenuId = null },
             title = { Text(com.hush.app.core.ContactsStore.nameOf(m.userId)) },
             text = {
                 Column {
                     Text(when (m.role) { GroupRole.OWNER -> "群主"; GroupRole.ADMIN -> "管理员"; GroupRole.MEMBER -> "成员" }, color = Hush.colors.textSecondary)
                     Spacer(Modifier.height(12.dp))
-                    DialogOption("查看资料") { memberMenu = null; onProfile(m.userId) }
+                    DialogOption("查看资料") { memberMenuId = null; onProfile(m.userId) }
                     if (s.isOwner && !isMe && m.role != GroupRole.OWNER) {
-                        DialogOption(if (m.role == GroupRole.ADMIN) "取消管理员" else "设为管理员") { vm.setAdmin(m.userId, m.role != GroupRole.ADMIN); memberMenu = null }
+                        DialogOption(if (m.role == GroupRole.ADMIN) "取消管理员" else "设为管理员") { vm.setAdmin(m.userId, m.role != GroupRole.ADMIN); memberMenuId = null }
                     }
                     if (s.isAdmin && !isMe && m.role != GroupRole.OWNER) {
-                        DialogOption("移出群聊", danger = true) { confirmRemove = m; memberMenu = null }
+                        DialogOption("移出群聊", danger = true) { confirmRemoveId = m.userId; memberMenuId = null }
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { memberMenu = null }) { Text("关闭") } },
+            confirmButton = { TextButton(onClick = { memberMenuId = null }) { Text("关闭") } },
         )
     }
     confirmRemove?.let { m ->
         ConfirmDialog(
             "移出群聊", "确定将 ${com.hush.app.core.ContactsStore.nameOf(m.userId)} 移出群聊？", "移出", danger = true,
-            onConfirm = { vm.removeMember(m.userId) }, onDismiss = { confirmRemove = null },
+            onConfirm = { vm.removeMember(m.userId) }, onDismiss = { confirmRemoveId = null },
         )
     }
     edit?.let { field ->
-        var text by remember(field) { mutableStateOf(if (field == "name") g?.name ?: "" else g?.announcement ?: "") }
+        var text by rememberSaveable(field) { mutableStateOf(if (field == "name") g?.name ?: "" else g?.announcement ?: "") }
         com.hush.app.util.DebugTextSink { text = it }
         AlertDialog(
             onDismissRequest = { edit = null },

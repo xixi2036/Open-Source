@@ -12,7 +12,7 @@ struct ProfileSetupView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 24) {
-                Text("设置你的资料").font(.system(size: 26, weight: .bold)).foregroundStyle(Theme.textPrimary)
+                Text("设置你的资料").font(Fonts.sized(26, weight: .bold)).foregroundStyle(Theme.textPrimary)
                 Text("好友会看到你的头像和昵称").font(Fonts.body).foregroundStyle(Theme.textSecondary)
                 AvatarPickerField(size: 110, avatarURL: $avatarURL) {
                     Circle().fill(Theme.surface)

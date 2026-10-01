@@ -52,7 +52,8 @@ class AppPrefs(context: Context) {
     }
 
     companion object {
-        const val DEFAULT_SERVER = "http://10.0.2.2:8080"
+        /** debug：模拟器访问宿主机的开发服务器；release：空，由用户填写（B1）。 */
+        val DEFAULT_SERVER: String = com.hush.app.BuildConfig.DEFAULT_SERVER
         private const val K_LOCK = "screen_lock"
         private const val K_SECURE = "screen_security"
         private const val K_SERVER = "server_url"

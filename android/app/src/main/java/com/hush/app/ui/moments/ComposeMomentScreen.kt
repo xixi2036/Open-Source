@@ -1,5 +1,7 @@
 package com.hush.app.ui.moments
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.hush.app.util.Savers
 import com.hush.app.util.net
 
 import android.net.Uri
@@ -79,12 +81,12 @@ import uniffi.hushcore.VisibilityMode
 @Composable
 fun ComposeMomentScreen(onBack: () -> Unit, onPosted: () -> Unit) {
     val context = LocalContext.current
-    var text by remember { mutableStateOf("") }
-    var images by remember { mutableStateOf(listOf<Uri>()) }
-    var mode by remember { mutableStateOf(VisibilityMode.ALL) }
-    var picked by remember { mutableStateOf(setOf<String>()) }
-    var visDialog by remember { mutableStateOf(false) }
-    var pickFor by remember { mutableStateOf<VisibilityMode?>(null) }
+    var text by rememberSaveable { mutableStateOf("") }
+    var images by rememberSaveable(stateSaver = Savers.UriList) { mutableStateOf(listOf<Uri>()) }
+    var mode by rememberSaveable { mutableStateOf(VisibilityMode.ALL) }
+    var picked by rememberSaveable(stateSaver = Savers.StringSet) { mutableStateOf(setOf<String>()) }
+    var visDialog by rememberSaveable { mutableStateOf(false) }
+    var pickFor by rememberSaveable { mutableStateOf<VisibilityMode?>(null) }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     DebugTextSink { text = it }
@@ -195,7 +197,7 @@ private fun visibilityLabel(mode: VisibilityMode, n: Int) = when (mode) {
 @Composable
 private fun FriendSelect(mode: VisibilityMode, initial: Set<String>, onDone: (Set<String>) -> Unit, onBack: () -> Unit) {
     val friends by ContactsStore.friends.collectAsState()
-    var sel by remember { mutableStateOf(initial) }
+    var sel by rememberSaveable(stateSaver = Savers.StringSet) { mutableStateOf(initial) }
     Column(Modifier.fillMaxSize().background(Hush.colors.background)) {
         HushTopBar(if (mode == VisibilityMode.INCLUDE) "选择可见的好友" else "选择不给看的好友", onBack = onBack, actions = {
             TextButton(onClick = { onDone(sel) }) { Text("完成(${sel.size})") }

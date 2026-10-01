@@ -25,7 +25,7 @@ struct PrimaryButtonStyle: ButtonStyle {
     var enabled = true
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 17, weight: .semibold))
+            .font(Fonts.sized(17, weight: .semibold))
             .foregroundStyle(Theme.onAccent)
             .frame(maxWidth: .infinity, minHeight: 50)
             .background(RoundedRectangle(cornerRadius: Theme.cardRadius).fill(Theme.accent.opacity(enabled ? 1 : 0.4)))
@@ -42,7 +42,7 @@ struct BadgeView: View {
             Circle().fill(Theme.textSecondary.opacity(0.6)).frame(width: 10, height: 10)
         } else if count > 0 {
             Text(count > 99 ? "99+" : "\(count)")
-                .font(.system(size: 12, weight: .semibold))
+                .font(Fonts.sized(12, weight: .semibold))
                 .foregroundStyle(.white)
                 .padding(.horizontal, count > 9 ? 6 : 0)
                 .frame(minWidth: 20, minHeight: 20)
@@ -68,33 +68,6 @@ struct ConnectionBanner: View {
             .accessibilityIdentifier("connectionBanner")
         }
     }
-}
-
-/// 全局 toast
-struct ToastModifier: ViewModifier {
-    @Bindable var core = HushCore.shared
-    func body(content: Content) -> some View {
-        content.overlay(alignment: .top) {
-            if let t = core.toast {
-                Text(t)
-                    .font(Fonts.secondary)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(Capsule().fill(Color.black.opacity(0.8)))
-                    .padding(.top, 60)
-                    .transition(.opacity)
-                    .task(id: t) {
-                        try? await Task.sleep(for: .seconds(2.2))
-                        if core.toast == t { withAnimation { core.toast = nil } }
-                    }
-                    .accessibilityIdentifier("toast")
-            }
-        }
-    }
-}
-
-extension View {
-    func withToast() -> some View { modifier(ToastModifier()) }
 }
 
 /// 设置页的一行（图标 + 标题 + 右侧值）

@@ -61,7 +61,11 @@ data class CallUiState(
     val callId: String = "",
     val connectedAt: Long = 0,
     val muted: Boolean = false,
-    val speaker: Boolean = false,
+    /** 当前音频输出设备与可选设备（听筒 / 扬声器 / 蓝牙 / 有线耳机）。 */
+    val route: AudioRoute = AudioRoute.EARPIECE,
+    val routes: List<AudioRoute> = emptyList(),
+    /** 已接通但媒体连接中断、正在尝试恢复（B8）。 */
+    val reconnecting: Boolean = false,
     val cameraOff: Boolean = false,
     val frontCamera: Boolean = true,
     val endReason: String? = null,
@@ -71,7 +75,9 @@ data class CallUiState(
     val remoteHasVideo: Boolean = false,
     /** 本机无法发送视频时的原因（无摄像头 / 无权限 / 摄像头出错）；null 表示摄像头可用。 */
     val cameraIssue: String? = null,
-)
+) {
+    val speaker: Boolean get() = route == AudioRoute.SPEAKER
+}
 
 /**
  * 1:1 语音/视频通话：WebRTC PeerConnection + 核心信令（send_call_signal / CallSignalReceived）。
@@ -95,6 +101,22 @@ object CallManager {
     private val _state = MutableStateFlow(CallUiState())
     val state: StateFlow<CallUiState> = _state
 
+    private val _minimized = MutableStateFlow(false)
+    /** 通话页已最小化为悬浮条（返回键 / 最小化按钮），用户可以回到聊天继续操作。 */
+    val minimized: StateFlow<Boolean> = _minimized
+
+    fun minimize() {
+        if (CallLogic.canMinimize(_state.value.phase)) _minimized.value = true
+    }
+
+    fun maximize() {
+        _minimized.value = false
+    }
+
+    private val _notice = kotlinx.coroutines.flow.MutableSharedFlow<String>(extraBufferCapacity = 4)
+    /** 一次性提示（例如没有网络无法发起通话），由根界面以 Toast 显示。 */
+    val notice: kotlinx.coroutines.flow.SharedFlow<String> = _notice
+
     private lateinit var appContext: Context
     private val scope get() = HushCore.scope
     val eglBase: EglBase by lazy { EglBase.create() }
@@ -109,6 +131,14 @@ object CallManager {
     private var timeoutJob: Job? = null
     /** 当前通话的建立协程（发起 / 接听 / 处理应答），挂断时取消。 */
     private var setupJob: Job? = null
+    /** 本端是主叫（ICE 重启只由主叫发起，避免两边同时重新协商）。 */
+    private var isCaller = false
+    /** OFFER 是否已成功发出：没发出去的呼叫结束时不必再发 HANGUP。 */
+    private var offerSent = false
+    private var reconnectJob: Job? = null
+    private var restartJob: Job? = null
+    /** 来电响铃到接通建立期间的限时 WakeLock（B3）：息屏状态下保证信令处理不被休眠打断。 */
+    private var ringWakeLock: android.os.PowerManager.WakeLock? = null
     private var audioSource: AudioSource? = null
     private var audioTrack: AudioTrack? = null
     private var videoTrack: VideoTrack? = null
@@ -133,6 +163,13 @@ object CallManager {
                 if (ev is CoreEvent.CallSignalReceived) withContext(Dispatchers.Main) { onSignal(ev.fromUserId, ev.signal) }
             }
         }
+        // B7：语音通话用听筒时启用距离感应熄屏；最小化状态随通话结束复位
+        scope.launch(Dispatchers.Main) {
+            _state.collect { s ->
+                audio.setProximity(CallLogic.proximityOn(s.phase, s.video, s.route))
+                if (s.phase == CallPhase.IDLE) _minimized.value = false
+            }
+        }
     }
 
     val isBusy: Boolean get() = CallLogic.isBusy(_state.value.phase)
@@ -152,9 +189,18 @@ object CallManager {
 
     // ---------------- 对外操作 ----------------
 
-    fun startCall(peerId: String, video: Boolean) {
-        if (isBusy) return
+    /**
+     * 发起通话。没有网络时直接提示并返回 false（A2：不再“正在呼叫…”干等 30 秒）。
+     */
+    fun startCall(peerId: String, video: Boolean): Boolean {
+        if (isBusy) return false
+        if (!com.hush.app.core.NetworkMonitor.online.value) {
+            _notice.tryEmit("当前没有网络连接，无法发起通话")
+            return false
+        }
         val callId = UUID.randomUUID().toString()
+        _minimized.value = false
+        isCaller = true; offerSent = false
         _state.value = CallUiState(phase = CallPhase.OUTGOING, peerId = peerId, video = video, callId = callId)
         ContactsStore.ensure(peerId)
         setupJob?.cancel()
@@ -167,7 +213,19 @@ object CallManager {
                 ensureCurrent(callId)
                 conn.awaitSetLocal(offer)
                 ensureCurrent(callId)
-                send(CallSignal(callId, CallAction.OFFER, video, offer.description, emptyList()))
+                // A2：OFFER 只发一次并等待结果。核心对每次发送失败的 OFFER 都会写一条“通话失败”记录，
+                // 所以这里不能走 net{} 重试（否则出现两条重复记录）；发送失败立即结束并提示。
+                val sent = withContext(Dispatchers.IO) {
+                    runCatching { HushCore.client.sendCallSignal(peerId, CallSignal(callId, CallAction.OFFER, video, offer.description, emptyList())) }
+                }
+                ensureCurrent(callId)
+                if (sent.isFailure) {
+                    Log.w(TAG, "send OFFER", sent.exceptionOrNull())
+                    end("呼叫未能发出，请检查网络")
+                    return@launch
+                }
+                offerSent = true
+                audio.startRingback()
                 armTimeout(callId) {
                     send(CallSignal(callId, CallAction.HANGUP, video, null, emptyList()))
                     end("无人接听")
@@ -176,10 +234,11 @@ object CallManager {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "startCall", e)
-                send(CallSignal(callId, CallAction.HANGUP, video, null, emptyList()))
+                if (offerSent) send(CallSignal(callId, CallAction.HANGUP, video, null, emptyList()))
                 end("通话建立失败")
             }
         }
+        return true
     }
 
     fun accept() {
@@ -188,6 +247,7 @@ object CallManager {
         audio.stopRinging()
         timeoutJob?.cancel()
         Notifier.cancelIncomingCall(appContext)
+        isCaller = false
         _state.update { it.copy(phase = CallPhase.CONNECTING) }
         setupJob?.cancel()
         setupJob = scope.launch(Dispatchers.Main) {
@@ -244,7 +304,8 @@ object CallManager {
     fun hangup() {
         val st = _state.value
         if (!isBusy) return
-        send(CallSignal(st.callId, CallAction.HANGUP, st.video, null, emptyList()))
+        // 主叫的 OFFER 还没发出去（仍在建立本地媒体）就挂断：对方从未收到呼叫，不必发 HANGUP
+        if (!isCaller || offerSent) send(CallSignal(st.callId, CallAction.HANGUP, st.video, null, emptyList()))
         end("通话已结束")
     }
 
@@ -254,10 +315,31 @@ object CallManager {
         _state.update { it.copy(muted = m) }
     }
 
-    fun toggleSpeaker() {
-        val s = !_state.value.speaker
-        audio.routeSpeaker(s)
-        _state.update { it.copy(speaker = s) }
+    /**
+     * 扬声器按钮：只有听筒/扬声器时直接切换并返回 true；还接着耳机或蓝牙时返回 false，由界面弹出设备列表。
+     */
+    fun toggleSpeaker(): Boolean {
+        val st = _state.value
+        val target = CallLogic.toggleTarget(st.route, st.routes.ifEmpty { audio.availableRoutes() }) ?: return false
+        selectRoute(target)
+        return true
+    }
+
+    /** 选择音频输出设备（听筒 / 扬声器 / 蓝牙 / 有线耳机）。 */
+    fun selectRoute(route: AudioRoute) {
+        if (!isBusy) return
+        if (audio.setRoute(route)) _state.update { it.copy(route = route, routes = audio.availableRoutes()) }
+        else _state.update { it.copy(routes = audio.availableRoutes()) }
+    }
+
+    /** 耳机插拔、蓝牙连断：刷新设备列表，必要时自动切换。 */
+    private fun onAudioDevicesChanged() {
+        val st = _state.value
+        if (!isBusy) return
+        val after = audio.availableRoutes()
+        val next = CallLogic.routeAfterDeviceChange(st.route, st.routes, after, st.video)
+        if (next != st.route) audio.setRoute(next)
+        _state.update { it.copy(route = next, routes = after) }
     }
 
     /**
@@ -295,14 +377,24 @@ object CallManager {
         when (sig.action) {
             CallAction.OFFER -> {
                 if (isBusy) {
-                    if (sig.callId != st.callId) send(CallSignal(sig.callId, CallAction.BUSY, sig.video, null, emptyList()), to = from)
+                    when {
+                        // B8：同一通话的再次 OFFER 是对方发起的 ICE 重启
+                        sig.callId == st.callId -> if (from == st.peerId) onRestartOffer(sig)
+                        // B9：双方同时互拨。按 user_id 决定谁让步，两边都不回 BUSY
+                        st.phase == CallPhase.OUTGOING && from == st.peerId ->
+                            if (CallLogic.yieldsOnGlare(HushCore.myId, from)) yieldToIncoming(from, sig)
+                        else -> send(CallSignal(sig.callId, CallAction.BUSY, sig.video, null, emptyList()), to = from)
+                    }
                     return
                 }
                 remoteOffer = sig.sdp
                 remoteDescSet = false
                 pendingRemoteIce.clear()
+                isCaller = false; offerSent = false
+                _minimized.value = false
                 _state.value = CallUiState(phase = CallPhase.INCOMING, peerId = from, video = sig.video, callId = sig.callId)
                 ContactsStore.ensure(from)
+                holdRingWakeLock()
                 audio.startRinging()
                 Notifier.showIncomingCall(appContext, from, sig.video, sig.callId)
                 armTimeout(sig.callId, INCOMING_TIMEOUT_MS) {
@@ -314,8 +406,20 @@ object CallManager {
                 }
             }
             CallAction.ANSWER -> {
-                if (sig.callId != st.callId || st.phase != CallPhase.OUTGOING) return
+                if (sig.callId != st.callId || from != st.peerId) return
+                // B8：已接通后的 ANSWER 是对 ICE 重启 OFFER 的应答
+                if (st.phase == CallPhase.ACTIVE || st.phase == CallPhase.CONNECTING) {
+                    val conn = pc ?: return
+                    if (!isCaller || conn.signalingState() != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) return
+                    scope.launch(Dispatchers.Main) {
+                        runCatching { conn.awaitSetRemote(SessionDescription(SessionDescription.Type.ANSWER, sig.sdp ?: error("no sdp"))) }
+                            .onFailure { Log.w(TAG, "restart answer", it) }
+                    }
+                    return
+                }
+                if (st.phase != CallPhase.OUTGOING) return
                 timeoutJob?.cancel()
+                audio.stopRingback()
                 _state.update { it.copy(phase = CallPhase.CONNECTING) }
                 val conn = pc ?: return
                 setupJob?.cancel()
@@ -325,6 +429,12 @@ object CallManager {
                         ensureCurrent(sig.callId)
                         remoteDescSet = true
                         drainRemoteIce()
+                        // 对方接听后若迟迟连不上媒体，不能无限停在“正在连接…”
+                        armTimeout(sig.callId) {
+                            if (_state.value.phase == CallPhase.CONNECTING) {
+                                send(CallSignal(sig.callId, CallAction.HANGUP, sig.video, null, emptyList())); end("连接超时")
+                            }
+                        }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -340,9 +450,120 @@ object CallManager {
                 }
             }
             CallAction.HANGUP -> if (sig.callId == st.callId && isBusy) end(if (st.phase == CallPhase.INCOMING) "对方已取消" else "对方已挂断")
-            CallAction.REJECT -> if (sig.callId == st.callId && isBusy) end("对方已拒绝")
-            CallAction.BUSY -> if (sig.callId == st.callId && isBusy) end("对方忙线中")
+            CallAction.REJECT -> if (sig.callId == st.callId && isBusy) { audio.playBusyTone(); end("对方已拒绝") }
+            CallAction.BUSY -> if (sig.callId == st.callId && isBusy) { audio.playBusyTone(); end("对方忙线中") }
         }
+    }
+
+    /**
+     * B9：同时互拨且本端让步。放弃自己的呼叫（不发 HANGUP：对方按同一规则忽略了我们的 OFFER，
+     * 双方都不会因此多出一条通话记录），改为直接接听对方的呼叫——两边本来就都想通话。
+     */
+    private fun yieldToIncoming(from: String, sig: CallSignal) {
+        Log.i(TAG, "glare: yield to incoming call")
+        release()
+        remoteOffer = sig.sdp
+        remoteDescSet = false
+        pendingRemoteIce.clear()
+        isCaller = false; offerSent = false
+        _state.value = CallUiState(phase = CallPhase.INCOMING, peerId = from, video = sig.video, callId = sig.callId)
+        accept()
+    }
+
+    // ---------------- ICE 重连（B8） ----------------
+
+    /** 媒体连接中断：提示“正在重连”，主叫发起 ICE 重启；超过 [CallLogic.RECONNECT_TIMEOUT_MS] 仍未恢复则挂断。 */
+    private fun onMediaInterrupted(failed: Boolean) {
+        val st = _state.value
+        if (st.phase != CallPhase.ACTIVE) {
+            // 尚未接通就失败：建立不起来，直接结束
+            if (failed && isBusy) hangup()
+            return
+        }
+        if (!st.reconnecting) _state.update { it.copy(reconnecting = true) }
+        if (reconnectJob?.isActive != true) {
+            val callId = st.callId
+            reconnectJob = scope.launch(Dispatchers.Main) {
+                delay(CallLogic.RECONNECT_TIMEOUT_MS)
+                val cur = _state.value
+                if (cur.callId == callId && cur.phase == CallPhase.ACTIVE && cur.reconnecting) {
+                    send(CallSignal(callId, CallAction.HANGUP, cur.video, null, emptyList()))
+                    end("网络连接已断开")
+                }
+            }
+        }
+        if (isCaller) restartIce(st.callId, immediate = failed)
+    }
+
+    private fun onMediaRecovered() {
+        reconnectJob?.cancel(); reconnectJob = null
+        restartJob?.cancel(); restartJob = null
+        if (_state.value.reconnecting) _state.update { it.copy(reconnecting = false) }
+    }
+
+    /**
+     * 主叫发起 ICE 重启：同一 call_id 再发一次带新 ICE 凭据的 OFFER（核心对重复的 OFFER / ANSWER 是幂等的，
+     * 不会重置接通时间或多写通话记录）。DISCONNECTED 可能是瞬时抖动，先等 2 秒看能否自行恢复。
+     */
+    private fun restartIce(callId: String, immediate: Boolean) {
+        if (restartJob?.isActive == true) return
+        restartJob = scope.launch(Dispatchers.Main) {
+            try {
+                if (!immediate) delay(2000)
+                while (true) {
+                    ensureCurrent(callId)
+                    if (!_state.value.reconnecting) return@launch
+                    val conn = pc ?: return@launch
+                    if (conn.signalingState() == PeerConnection.SignalingState.STABLE) {
+                        val video = _state.value.video
+                        conn.restartIce()
+                        val offer = conn.awaitCreate(offer = true, video = video, iceRestart = true)
+                        ensureCurrent(callId)
+                        conn.awaitSetLocal(offer)
+                        ensureCurrent(callId)
+                        send(CallSignal(callId, CallAction.OFFER, video, offer.description, emptyList()))
+                    }
+                    // 这次 OFFER 可能因为网络还没恢复没送到：每 8 秒再试，直到恢复或超时挂断
+                    delay(8000)
+                    val c = pc ?: return@launch
+                    if (c.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+                        runCatching { c.awaitSetLocal(SessionDescription(SessionDescription.Type.ROLLBACK, "")) }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "restartIce", e)
+            }
+        }
+    }
+
+    /** 被叫处理 ICE 重启 OFFER：应用新的远端描述并回 ANSWER。 */
+    private fun onRestartOffer(sig: CallSignal) {
+        val st = _state.value
+        if (isCaller || (st.phase != CallPhase.ACTIVE && st.phase != CallPhase.CONNECTING)) return
+        val conn = pc ?: return
+        if (conn.signalingState() != PeerConnection.SignalingState.STABLE) return
+        scope.launch(Dispatchers.Main) {
+            try {
+                conn.awaitSetRemote(SessionDescription(SessionDescription.Type.OFFER, sig.sdp ?: error("no sdp")))
+                ensureCurrent(sig.callId)
+                val answer = conn.awaitCreate(offer = false, video = st.video)
+                ensureCurrent(sig.callId)
+                conn.awaitSetLocal(answer)
+                ensureCurrent(sig.callId)
+                send(CallSignal(sig.callId, CallAction.ANSWER, st.video, answer.description, emptyList()))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "restart offer", e)
+            }
+        }
+    }
+
+    private fun holdRingWakeLock() {
+        val wl = ringWakeLock ?: com.hush.app.core.KeepAlive.newWakeLock(appContext, "call-setup").also { ringWakeLock = it }
+        runCatching { wl?.acquire(90_000) }
     }
 
     private fun send(sig: CallSignal, to: String = _state.value.peerId) {
@@ -543,10 +764,14 @@ object CallManager {
                     PeerConnection.IceConnectionState.CONNECTED, PeerConnection.IceConnectionState.COMPLETED -> {
                         timeoutJob?.cancel()
                         if (_state.value.phase == CallPhase.CONNECTING || _state.value.phase == CallPhase.OUTGOING) {
+                            audio.stopRingback()
                             _state.update { it.copy(phase = CallPhase.ACTIVE, connectedAt = System.currentTimeMillis()) }
                         }
+                        onMediaRecovered()
                     }
-                    PeerConnection.IceConnectionState.FAILED -> if (isBusy) hangup()
+                    // B8：断开不立即挂断，提示“正在重连”并尝试 ICE 重启
+                    PeerConnection.IceConnectionState.DISCONNECTED -> if (isBusy) onMediaInterrupted(failed = false)
+                    PeerConnection.IceConnectionState.FAILED -> if (isBusy) onMediaInterrupted(failed = true)
                     else -> Unit
                 }
             }
@@ -572,11 +797,12 @@ object CallManager {
         override fun onRenegotiationNeeded() {}
     }
 
-    private suspend fun PeerConnection.awaitCreate(offer: Boolean, video: Boolean): SessionDescription =
+    private suspend fun PeerConnection.awaitCreate(offer: Boolean, video: Boolean, iceRestart: Boolean = false): SessionDescription =
         suspendCancellableCoroutine { cont ->
             val c = MediaConstraints().apply {
                 mandatory += MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true")
                 mandatory += MediaConstraints.KeyValuePair("OfferToReceiveVideo", video.toString())
+                if (iceRestart) mandatory += MediaConstraints.KeyValuePair("IceRestart", "true")
             }
             val obs = object : SdpObserver {
                 override fun onCreateSuccess(sdp: SessionDescription) { cont.resume(sdp) }
@@ -603,26 +829,39 @@ object CallManager {
 
     /** 进入通话媒体阶段：音频焦点与路由（接耳机时不强制外放），并启动通话前台服务（此时 App 在前台）。 */
     private fun startMedia(video: Boolean) {
-        val speaker = audio.start(video)
-        _state.update { it.copy(speaker = speaker) }
+        val route = audio.start(video)
+        _state.update { it.copy(route = route, routes = audio.availableRoutes()) }
+        audio.watchDevices { onAudioDevicesChanged() }
         CallService.start(appContext, video)
     }
 
     // ---------------- 结束 ----------------
 
     private fun end(reason: String) {
+        val endedCallId = _state.value.callId
+        // 先让界面释放渲染器，再销毁 WebRTC 对象
+        _state.update { it.copy(phase = CallPhase.ENDED, endReason = reason, remoteVideo = null, localVideo = null, remoteHasVideo = false, reconnecting = false) }
+        release()
+        scope.launch(Dispatchers.Main) {
+            delay(1800)
+            if (_state.value.phase == CallPhase.ENDED && _state.value.callId == endedCallId) _state.value = CallUiState()
+        }
+    }
+
+    /** 释放当前通话的全部资源（协程、铃声、WebRTC 对象、音频、前台服务），不改变界面状态。 */
+    private fun release() {
         setupJob?.cancel(); setupJob = null
         timeoutJob?.cancel()
         iceFlushJob?.cancel()
+        reconnectJob?.cancel(); reconnectJob = null
+        restartJob?.cancel(); restartJob = null
         audio.stopRinging()
+        runCatching { if (ringWakeLock?.isHeld == true) ringWakeLock?.release() }
         Notifier.cancelIncomingCall(appContext)
         remoteWatchJob?.cancel(); remoteWatchJob = null
         // 须在 pc.dispose() 之前摘掉 sink（之后原生轨道已释放）
         remoteTrack?.let { t -> runCatching { t.removeSink(remoteFrameSink) } }
         remoteTrack = null; lastRemoteFrameAt = 0L
-        val endedCallId = _state.value.callId
-        // 先让界面释放渲染器，再销毁 WebRTC 对象
-        _state.update { it.copy(phase = CallPhase.ENDED, endReason = reason, remoteVideo = null, localVideo = null, remoteHasVideo = false) }
         val oldCap = capturer; val oldHelper = textureHelper; val oldSrc = videoSource; val oldPc = pc
         val oldAudioTrack = audioTrack; val oldVideoTrack = videoTrack; val oldAudioSrc = audioSource
         capturer = null; textureHelper = null; videoSource = null; videoTrack = null; videoSender = null
@@ -641,8 +880,6 @@ object CallManager {
             runCatching { oldSrc?.dispose() }
             runCatching { oldAudioSrc?.dispose() }
             runCatching { oldHelper?.dispose() }
-            delay(1500)
-            if (_state.value.phase == CallPhase.ENDED && _state.value.callId == endedCallId) _state.value = CallUiState()
         }
     }
 }

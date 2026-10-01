@@ -6,6 +6,10 @@ import (
 	"errors"
 )
 
+// MaxOneTimeKeys 是每个用户在服务端保留的一次性密钥总量上限（客户端的目标存量是 100）。
+// 超出时丢弃最早上传的：上传接口没有别的总量限制，否则可以无限灌库。
+const MaxOneTimeKeys = 200
+
 // SignedKey 是一次性密钥或 fallback 密钥（契约 3.2）。
 type SignedKey struct {
 	KeyID     string `json:"key_id"`
@@ -41,7 +45,7 @@ type KeyUpload struct {
 // 避免旧设备在重新登录的同时补充 OTK，把旧身份密钥以新设备代写入。
 func (s *Store) UploadKeys(ctx context.Context, userID string, up KeyUpload) (int, error) {
 	var count int
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx dbtx) error {
 		var curGen int64
 		err := tx.QueryRowContext(ctx, `SELECT u.device_generation FROM tokens t JOIN users u ON u.id = t.user_id
 			WHERE t.token_hash = ? AND t.user_id = ?`, up.TokenHash, userID).Scan(&curGen)
@@ -81,7 +85,18 @@ func (s *Store) UploadKeys(ctx context.Context, userID string, up KeyUpload) (in
 				return err
 			}
 		}
-		return tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM one_time_keys WHERE user_id = ?", userID).Scan(&count)
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM one_time_keys WHERE user_id = ?", userID).Scan(&count); err != nil {
+			return err
+		}
+		if count > MaxOneTimeKeys {
+			// 超出总量上限：丢弃最早上传的，保留最新的（客户端手里一定还有它们的私钥）
+			if _, err := tx.ExecContext(ctx, `DELETE FROM one_time_keys WHERE user_id = ?1 AND seq NOT IN (
+				SELECT seq FROM one_time_keys WHERE user_id = ?1 ORDER BY seq DESC LIMIT ?2)`, userID, MaxOneTimeKeys); err != nil {
+				return err
+			}
+			count = MaxOneTimeKeys
+		}
+		return nil
 	})
 	return count, err
 }
@@ -112,7 +127,7 @@ func getIdentity(ctx context.Context, ex execer, userID string) (IdentityKeys, e
 func (s *Store) ClaimKey(ctx context.Context, userID string) (IdentityKeys, ClaimedKey, error) {
 	var id IdentityKeys
 	var ck ClaimedKey
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx dbtx) error {
 		var err error
 		if id, err = getIdentity(ctx, tx, userID); err != nil {
 			return err

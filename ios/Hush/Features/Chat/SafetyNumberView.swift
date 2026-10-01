@@ -15,7 +15,7 @@ struct SafetyNumberView: View {
                 if let sn {
                     if sn.verified {
                         Label("已核验", systemImage: "checkmark.shield.fill")
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(Fonts.sized(15, weight: .semibold))
                             .foregroundStyle(Theme.success)
                             .padding(.horizontal, 14).padding(.vertical, 6)
                             .background(Capsule().fill(Theme.success.opacity(0.12)))
@@ -40,7 +40,7 @@ struct SafetyNumberView: View {
                             .buttonStyle(PrimaryButtonStyle())
                             .accessibilityIdentifier("scanVerify")
                         Button(sn.verified ? "取消核验" : "标记为已核验") { toggleVerified(!sn.verified) }
-                            .font(.system(size: 16, weight: .medium))
+                            .font(Fonts.sized(16, weight: .medium))
                             .frame(maxWidth: .infinity, minHeight: 46)
                             .background(RoundedRectangle(cornerRadius: Theme.cardRadius).fill(Theme.surface))
                             .accessibilityIdentifier("toggleVerified")
@@ -73,7 +73,7 @@ struct SafetyNumberView: View {
         let groups = stride(from: 0, to: chars.count, by: 5).map { String(chars[$0..<min($0 + 5, chars.count)]) }
         return LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 12) {
             ForEach(Array(groups.enumerated()), id: \.offset) { _, g in
-                Text(g).font(.system(size: 20, weight: .medium, design: .monospaced)).foregroundStyle(Theme.textPrimary)
+                Text(g).font(Fonts.sized(20, weight: .medium, design: .monospaced)).foregroundStyle(Theme.textPrimary)
             }
         }
         .padding(16)

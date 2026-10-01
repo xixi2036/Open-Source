@@ -18,7 +18,8 @@ struct ImageViewer: View {
             Color.black.ignoresSafeArea()
             TabView(selection: $index) {
                 ForEach(Array(paths.enumerated()), id: \.offset) { i, p in
-                    ZoomableImage(path: p).tag(i).ignoresSafeArea()
+                    // C5：只有当前页和前后各一页持有解码后的原图，其余页释放
+                    ZoomableImage(path: p, active: Self.shouldLoad(page: i, current: index)).tag(i).ignoresSafeArea()
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: paths.count > 1 ? .automatic : .never))
@@ -29,6 +30,7 @@ struct ImageViewer: View {
                         .foregroundStyle(.white).frame(width: 44, height: 44)
                         .background(Circle().fill(Color.white.opacity(0.15)))
                 }
+                .accessibilityLabel("关闭")
                 .accessibilityIdentifier("closeViewer")
                 Spacer()
                 Button { save() } label: {
@@ -36,12 +38,16 @@ struct ImageViewer: View {
                         .foregroundStyle(.white).frame(width: 44, height: 44)
                         .background(Circle().fill(Color.white.opacity(0.15)))
                 }
+                .accessibilityLabel("保存到相册")
                 .accessibilityIdentifier("saveImage")
             }
             .padding(.horizontal, 16)
         }
         .statusBarHidden()
     }
+
+    /// 当前页与前后各一页才加载原图
+    static func shouldLoad(page: Int, current: Int) -> Bool { abs(page - current) <= 1 }
 
     private func save() {
         guard index < paths.count else { return }
@@ -66,6 +72,8 @@ struct ImageViewer: View {
 
 struct ZoomableImage: UIViewRepresentable {
     let path: String
+    /// 是否加载原图（不在当前页附近时释放，避免一次把整个会话的图片都解码进内存）
+    var active = true
 
     func makeUIView(context: Context) -> UIScrollView {
         let sv = UIScrollView()
@@ -81,26 +89,47 @@ struct ZoomableImage: UIViewRepresentable {
         iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         iv.isAccessibilityElement = true
         iv.accessibilityIdentifier = "zoomImage"
+        iv.accessibilityLabel = "图片"
         sv.addSubview(iv)
         context.coordinator.imageView = iv
-        // 原图在后台解码，避免打开大图时卡住主线程
-        let path = path
-        Task { @MainActor [weak iv] in
-            let img = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: path)?.preparingForDisplay() }.value
-            iv?.image = img
-        }
         let dbl = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTap(_:)))
         dbl.numberOfTapsRequired = 2
         sv.addGestureRecognizer(dbl)
+        context.coordinator.setActive(active, path: path, scroll: sv)
         return sv
     }
 
-    func updateUIView(_ uiView: UIScrollView, context: Context) {}
+    func updateUIView(_ sv: UIScrollView, context: Context) {
+        context.coordinator.setActive(active, path: path, scroll: sv)
+    }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    @MainActor
     final class Coordinator: NSObject, UIScrollViewDelegate {
         weak var imageView: UIImageView?
+        private var loadedPath: String?
+        private var task: Task<Void, Never>?
+
+        func setActive(_ active: Bool, path: String, scroll: UIScrollView) {
+            guard active else {
+                task?.cancel(); task = nil
+                loadedPath = nil
+                imageView?.image = nil
+                if scroll.zoomScale != 1 { scroll.zoomScale = 1 }
+                return
+            }
+            guard loadedPath != path else { return }
+            loadedPath = path
+            task?.cancel()
+            // 原图在后台解码，避免打开大图时卡住主线程
+            task = Task { @MainActor [weak self] in
+                let img = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: path)?.preparingForDisplay() }.value
+                guard !Task.isCancelled, let self, self.loadedPath == path else { return }
+                self.imageView?.image = img
+            }
+        }
+
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { imageView }
         @objc func doubleTap(_ g: UITapGestureRecognizer) {
             guard let sv = g.view as? UIScrollView else { return }

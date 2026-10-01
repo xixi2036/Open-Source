@@ -19,6 +19,10 @@
 	<key>NSPhotoLibraryUsageDescription</key><string>Hush 需要访问相册以发送图片、设置头像和发布朋友圈。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key><string>Hush 需要将图片保存到你的相册。</string>
 	<key>NSFaceIDUsageDescription</key><string>Hush 使用面容 ID 解锁屏幕锁，保护你的聊天记录。</string>
+	<key>NSLocalNetworkUsageDescription</key><string>Hush 需要访问本地网络，以连接部署在局域网内的 Hush 服务器并建立通话。</string>
+	<!-- 出口合规：App 自带端到端加密（Olm/Megolm、AES-256-GCM），不属于“仅使用系统自带加密”的豁免情形，如实声明为 true。
+	     上传到 App Store Connect 后需要按提示提供出口合规信息（或年度自分类报告）；是否适用其他豁免由发布负责人确认。 -->
+	<key>ITSAppUsesNonExemptEncryption</key><true/>
 	<key>UIBackgroundModes</key><array><string>audio</string></array>
 </dict>
 </plist>

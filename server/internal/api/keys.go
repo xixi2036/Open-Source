@@ -2,7 +2,7 @@ package api
 
 import (
 	"errors"
-	"log"
+	"hush/server/internal/logx"
 	"net/http"
 	"time"
 
@@ -21,6 +21,9 @@ func validSignedKey(k store.SignedKey) bool {
 
 // PUT /v1/keys → {one_time_key_count}
 func (s *Server) handleUploadKeys(w http.ResponseWriter, r *http.Request, uid string) {
+	if !s.allowWrite(w, uid, "keys") {
+		return
+	}
 	var req struct {
 		IdentityKey string            `json:"identity_key"`
 		SigningKey  string            `json:"signing_key"`
@@ -65,7 +68,7 @@ func (s *Server) handleUploadKeys(w http.ResponseWriter, r *http.Request, uid st
 		internalErr(w, r, err)
 		return
 	}
-	log.Printf("[keys] user=%s 上传 %d 个 OTK（fallback=%v），剩余 %d", uid, len(req.OneTimeKeys), req.FallbackKey != nil, n)
+	logx.Debugf("[keys] user=%s 上传 %d 个 OTK（fallback=%v），剩余 %d", uid, len(req.OneTimeKeys), req.FallbackKey != nil, n)
 	ok(w, obj{"one_time_key_count": n})
 }
 
@@ -94,7 +97,7 @@ func (s *Server) handleClaimKey(w http.ResponseWriter, r *http.Request, uid stri
 		return
 	}
 	if !s.claimLimiter.allow(uid+"|"+target, time.Now()) {
-		log.Printf("[keys] user=%s claim %s 过于频繁", uid, target)
+		logx.Debugf("[keys] user=%s claim %s 过于频繁", uid, target)
 		fail(w, codeRateLimited, "获取预密钥过于频繁，请稍后再试")
 		return
 	}
@@ -103,7 +106,7 @@ func (s *Server) handleClaimKey(w http.ResponseWriter, r *http.Request, uid stri
 		storeErr(w, r, err, "该用户没有可用的预密钥")
 		return
 	}
-	log.Printf("[keys] user=%s claim %s 的密钥（fallback=%v）", uid, target, key.Fallback)
+	logx.Debugf("[keys] user=%s claim %s 的密钥（fallback=%v）", uid, target, key.Fallback)
 	ok(w, obj{
 		"user_id":           id.UserID,
 		"identity_key":      id.IdentityKey,

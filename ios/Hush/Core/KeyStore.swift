@@ -48,12 +48,14 @@ enum KeyStore {
     }
 
     static func loadOrCreateDBKey() throws -> Data {
-        try resolve(SystemDBKeyBackend(), allowFileFallback: allowFileFallback)
+        try resolve(SystemDBKeyBackend(), allowFileFallback: allowFileFallback, databaseExists: AppPaths.databaseExists)
     }
 
     /// 读取或创建密钥。只有 Keychain 明确返回「不存在」时才会生成新密钥；
     /// 其他错误（设备首次解锁前、偶发的 -34018 等）直接报错，不写入、不删除任何东西。
-    static func resolve(_ b: DBKeyBackend, allowFileFallback: Bool) throws -> Data {
+    /// databaseExists：本地库文件已经存在。此时钥匙串「读取出错」且没有文件副本，说明密钥只是暂时读不到，
+    /// 即使在模拟器上也不能生成新密钥（新密钥打不开旧库，还会把真正的密钥顶掉）。
+    static func resolve(_ b: DBKeyBackend, allowFileFallback: Bool, databaseExists: Bool = false) throws -> Data {
         let file = b.readFile().flatMap { $0.count == keyLength ? $0 : nil }
         switch b.readKeychain() {
         case let .found(k) where k.count == keyLength:
@@ -74,8 +76,8 @@ enum KeyStore {
             throw KeyStoreError.persist(st)
         case let .error(st):
             if let f = file { return f }
-            guard allowFileFallback else { throw KeyStoreError.keychain(st) }
-            // 模拟器未签名构建：Keychain 不可用，密钥只存文件
+            guard allowFileFallback, !databaseExists else { throw KeyStoreError.keychain(st) }
+            // 模拟器未签名构建、首次启动：Keychain 不可用，密钥只存文件
             let key = try b.randomKey().get()
             guard b.writeFile(key) else { throw KeyStoreError.persist(st) }
             return key
@@ -172,6 +174,33 @@ enum AppPaths {
         let url = appSupport.appendingPathComponent("hush", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    /// 本地数据库文件是否已存在（决定钥匙串读不到时能不能生成新密钥）
+    static var databaseExists: Bool {
+        let dir = appSupport.appendingPathComponent("hush", isDirectory: true)
+        return FileManager.default.fileExists(atPath: dir.appendingPathComponent("hush.sqlite").path)
+    }
+
+    /// A2：整个数据目录（数据库、WAL、明文附件缓存 files/）不进 iCloud / 电脑备份，并显式设置文件保护级别。
+    /// 备份排除标记设在目录上即对其下所有内容生效；保护级别对已存在的文件逐个补设（新文件继承目录的级别）。
+    /// 用 completeUntilFirstUserAuthentication 而不是 complete：锁屏后后台仍要能写库（WAL）和收消息。
+    /// 会遍历目录，必须在后台线程、打开数据库之前调用。
+    static func protectDataDir(_ dir: URL = dataDir) {
+        var url = dir
+        var v = URLResourceValues()
+        v.isExcludedFromBackup = true
+        try? url.setResourceValues(v)
+        let fm = FileManager.default
+        let attrs: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        try? fm.setAttributes(attrs, ofItemAtPath: dir.path)
+        guard let walker = fm.enumerator(at: dir, includingPropertiesForKeys: [.fileProtectionKey]) else { return }
+        for case let item as URL in walker {
+            let current = try? item.resourceValues(forKeys: [.fileProtectionKey]).fileProtection
+            if current != .completeUntilFirstUserAuthentication && current != .complete {
+                try? fm.setAttributes(attrs, ofItemAtPath: item.path)
+            }
+        }
     }
 
     /// 发送前的临时文件（压缩后的图片、录音等）

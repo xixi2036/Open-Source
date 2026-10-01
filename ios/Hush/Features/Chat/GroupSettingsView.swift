@@ -19,12 +19,20 @@ struct GroupSettingsView: View {
     private var convId: String { "g:\(groupId)" }
     private var group: GroupInfo? { core.contacts.group(groupId) }
     private var myRole: GroupRole? { group?.members.first { $0.userId == core.myId }?.role }
-    private var isAdmin: Bool { myRole == .owner || myRole == .admin }
+    private var isAdmin: Bool { group?.active == true && (myRole == .owner || myRole == .admin) }
     private var isOwner: Bool { myRole == .owner }
 
     var body: some View {
         let g = group
         List {
+            if g?.active == false {
+                // 已退出 / 被移出 / 群已解散：页面仍可能留在导航栈里（例如通知点进来），明确说明并停用编辑入口
+                Section {
+                    Label("你已不在此群聊中", systemImage: "person.crop.circle.badge.xmark")
+                        .foregroundStyle(Theme.textSecondary)
+                        .accessibilityIdentifier("groupInactiveNotice")
+                }
+            }
             Section {
                 HStack(spacing: 14) {
                     ZStack(alignment: .bottomTrailing) {
@@ -125,7 +133,11 @@ struct GroupSettingsView: View {
                 core.run {
                     try await core.contacts.leaveGroup(groupId)
                     core.chats.reload()
+                    // A8：从「通讯录 → 群聊」进来时设置页在通讯录的导航栈里：当前 Tab 回到根页面；
+                    // 聊天 Tab 里可能也开着这个群的聊天页，一并退回列表
+                    Router.shared.popToRoot()
                     Router.shared.chatPath = .init()
+                    core.toast = "已退出群聊"
                 }
             }
         }
@@ -155,9 +167,9 @@ struct GroupSettingsView: View {
                         .offset(x: 4, y: -4)
                 }
             }
-            Text(core.contacts.displayName(m.userId)).font(.system(size: 11)).lineLimit(1)
+            Text(core.contacts.displayName(m.userId)).font(Fonts.sized(11)).lineLimit(1)
             if m.role != .member {
-                Text(m.role == .owner ? "群主" : "管理员").font(.system(size: 9)).foregroundStyle(Theme.accent)
+                Text(m.role == .owner ? "群主" : "管理员").font(Fonts.sized(9)).foregroundStyle(Theme.accent)
             }
         }
         .contentShape(Rectangle())
@@ -175,7 +187,7 @@ struct GroupSettingsView: View {
                 RoundedRectangle(cornerRadius: 10).stroke(Theme.divider, style: StrokeStyle(lineWidth: 1.5, dash: [4]))
                     .frame(width: 50, height: 50)
                     .overlay(Image(systemName: icon).foregroundStyle(Theme.textSecondary))
-                Text(" ").font(.system(size: 11))
+                Text(" ").font(Fonts.sized(11))
             }
         }
         .buttonStyle(.plain)

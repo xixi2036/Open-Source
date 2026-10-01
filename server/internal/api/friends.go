@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 	"errors"
-	"log"
+	"hush/server/internal/logx"
 	"net/http"
 
 	"hush/server/internal/store"
@@ -78,7 +78,7 @@ func (s *Server) handleSendFriendRequest(w http.ResponseWriter, r *http.Request,
 		view = views[0]
 		if res.BecameFriends {
 			// 对方已向我发出待处理申请：直接成为好友，返回该申请（status=accepted）。
-			return ws.Emit(t, []string{req.ToUserID}, "friend_accepted", "", obj{"user_id": uid})
+			return ws.Emit(t, []string{req.ToUserID}, "friend_accepted", "friend_accepted:"+uid, obj{"user_id": uid})
 		}
 		return ws.Emit(t, []string{req.ToUserID}, "friend_request", "friend_request:"+res.Request.ID, obj{"request": view})
 	})
@@ -86,9 +86,9 @@ func (s *Server) handleSendFriendRequest(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if res.BecameFriends {
-		log.Printf("[friends] %s 与 %s 互发申请，直接成为好友", uid, req.ToUserID)
+		logx.Debugf("[friends] %s 与 %s 互发申请，直接成为好友", uid, req.ToUserID)
 	} else {
-		log.Printf("[friends] %s -> %s 好友申请 %s", uid, req.ToUserID, res.Request.ID)
+		logx.Debugf("[friends] %s -> %s 好友申请 %s", uid, req.ToUserID, res.Request.ID)
 	}
 	ok(w, view)
 }
@@ -138,12 +138,12 @@ func (s *Server) handleAcceptFriendRequest(w http.ResponseWriter, r *http.Reques
 		if fr, err = t.AcceptFriendRequest(r.PathValue("id"), uid); err != nil {
 			return err
 		}
-		return ws.Emit(t, []string{fr.FromID}, "friend_accepted", "", obj{"user_id": uid})
+		return ws.Emit(t, []string{fr.FromID}, "friend_accepted", "friend_accepted:"+uid, obj{"user_id": uid})
 	})
 	if !friendErr(w, r, err, "好友申请不存在", "该申请已处理") {
 		return
 	}
-	log.Printf("[friends] %s 接受了 %s 的申请", uid, fr.FromID)
+	logx.Debugf("[friends] %s 接受了 %s 的申请", uid, fr.FromID)
 	ok(w, obj{})
 }
 
@@ -153,7 +153,7 @@ func (s *Server) handleRejectFriendRequest(w http.ResponseWriter, r *http.Reques
 	if !friendErr(w, r, err, "好友申请不存在", "该申请已处理") {
 		return
 	}
-	log.Printf("[friends] %s 拒绝了 %s 的申请", uid, fr.FromID)
+	logx.Debugf("[friends] %s 拒绝了 %s 的申请", uid, fr.FromID)
 	ok(w, obj{})
 }
 
@@ -169,6 +169,9 @@ func (s *Server) handleListFriends(w http.ResponseWriter, r *http.Request, uid s
 
 // DELETE /v1/friends/{user_id} → {}
 func (s *Server) handleRemoveFriend(w http.ResponseWriter, r *http.Request, uid string) {
+	if !s.allowWrite(w, uid, "friend_remove") {
+		return
+	}
 	other := r.PathValue("user_id")
 	var was bool
 	err := s.st.Update(r.Context(), func(t *store.Tx) error {
@@ -176,14 +179,14 @@ func (s *Server) handleRemoveFriend(w http.ResponseWriter, r *http.Request, uid 
 		if was, err = t.RemoveFriend(uid, other); err != nil || !was {
 			return err
 		}
-		return ws.Emit(t, []string{other}, "friend_removed", "", obj{"user_id": uid})
+		return ws.Emit(t, []string{other}, "friend_removed", "friend_removed:"+uid, obj{"user_id": uid})
 	})
 	if err != nil {
 		internalErr(w, r, err)
 		return
 	}
 	if was {
-		log.Printf("[friends] %s 删除好友 %s", uid, other)
+		logx.Debugf("[friends] %s 删除好友 %s", uid, other)
 	}
 	ok(w, obj{})
 }
@@ -216,7 +219,7 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request, uid string)
 		internalErr(w, r, err)
 		return
 	}
-	log.Printf("[friends] %s 拉黑 %s", uid, target)
+	logx.Debugf("[friends] %s 拉黑 %s", uid, target)
 	ok(w, obj{})
 }
 

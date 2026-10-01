@@ -173,11 +173,12 @@ final class ContactsStore {
         await refreshFriends()
     }
 
-    /// 删除好友并清空与其的单聊
+    /// 删除好友并删除与其的单聊。A9：用 deleteConversation（消息、附件缓存、草稿、会话行一并删除），
+    /// clearConversation 只清消息，会在列表里留下一个空会话行
     func removeFriend(_ userId: String) async throws {
         let c = try api()
         try await c.removeFriend(userId: userId)
-        try? c.clearConversation(convId: c.directConversationId(userId: userId))
+        try? c.deleteConversation(convId: c.directConversationId(userId: userId))
         await refreshFriends()
     }
 

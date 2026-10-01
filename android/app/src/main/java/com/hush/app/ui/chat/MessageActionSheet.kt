@@ -1,5 +1,6 @@
 package com.hush.app.ui.chat
 
+import androidx.compose.material.icons.filled.Checklist
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -58,7 +59,7 @@ val QuickEmojis = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
 /** 长按消息菜单：回应、回复、复制、转发、撤回、删除、详情。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MessageActionSheet(m: MessageItem, vm: ChatViewModel, onForward: (MessageItem) -> Unit, onDismiss: () -> Unit) {
+fun MessageActionSheet(m: MessageItem, vm: ChatViewModel, onForward: (MessageItem) -> Unit, onSelect: (MessageItem) -> Unit, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var confirmRecall by remember { mutableStateOf(false) }
@@ -67,7 +68,7 @@ fun MessageActionSheet(m: MessageItem, vm: ChatViewModel, onForward: (MessageIte
     val canRecall = m.isOutgoing && visible && m.status != MessageStatus.FAILED && m.status != MessageStatus.SENDING &&
         System.currentTimeMillis() - m.sentAt < 24 * 3600 * 1000L
     // U2：文字与已上传的附件可转发（发送中/失败的附件还没有服务端 id）
-    val canForward = !m.deleted && visible && m.status != MessageStatus.SENDING && m.status != MessageStatus.FAILED
+    val canForward = Selection.forwardable(m)
     val myReaction = m.reactions.firstOrNull { HushCore.myId in it.userIds }?.emoji
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet, containerColor = Hush.colors.background) {
@@ -97,6 +98,7 @@ fun MessageActionSheet(m: MessageItem, vm: ChatViewModel, onForward: (MessageIte
                 }
             }
             if (canForward) SheetItem(Icons.AutoMirrored.Filled.Forward, "转发", "act_forward") { onDismiss(); onForward(m) }
+            if (Selection.selectable(m)) SheetItem(Icons.Filled.Checklist, "多选", "act_select") { onDismiss(); onSelect(m) }
             if (canRecall) SheetItem(Icons.AutoMirrored.Filled.Undo, "撤回", "act_recall") { confirmRecall = true }
             SheetItem(Icons.Filled.Delete, "删除", "act_delete", Hush.colors.danger) { vm.deleteLocal(m); onDismiss() }
             SheetItem(Icons.Filled.Info, "详情", "act_info") { showInfo = true }

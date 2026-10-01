@@ -65,7 +65,7 @@ func TestMomentMediaLifecycle(t *testing.T) {
 	if err := s.CreateAttachment(ctx, Attachment{ID: "img", UploaderID: uid, Size: 1, CreatedAt: 1}); err != nil {
 		t.Fatal(err)
 	}
-	row, err := s.CreateMoment(ctx, uid, "", []Media{{AttachmentID: "img"}, {AttachmentID: "img"}}, Visibility{Mode: VisAll})
+	row, err := s.CreateMoment(ctx, uid, "", []Media{{AttachmentID: "img"}, {AttachmentID: "img"}}, Visibility{Mode: VisAll}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -54,6 +54,7 @@ impl Inner {
     /// 对端身份变更：丢弃 Olm 会话、清除核验标记、群密钥重新分发、插入系统提示、发事件。
     pub(crate) fn on_identity_changed(&self, uid: &str, new_rec: Option<IdentityRec>) -> Result<()> {
         let had_old = self.store.get_identity(uid)?.is_some();
+        self.forget_claim_refusal(Some(uid));
         self.store.delete_olm_sessions(uid)?;
         self.store.unshare_user(uid)?;
         match new_rec {
